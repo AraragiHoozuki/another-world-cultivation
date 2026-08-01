@@ -1,0 +1,291 @@
+import type { QuestDefinition } from "../types";
+
+export const QUESTS: QuestDefinition[] = [
+  {
+    id: "missing-caravan",
+    title: "雾岭失踪者",
+    summary: "追查一支消失在雾岭商道上的队伍。",
+    offerText: "一名满身泥水的车夫正在寻找愿意进入雾岭的人。他只带回了半辆车，以及一串不属于商队的脚印。",
+    offerRoles: ["settlement", "market"],
+    timeLimitDays: 24,
+    once: true,
+    weight: 1.3,
+    stages: [
+      {
+        id: "question-driver",
+        title: "断裂的车辙",
+        body: "车夫把残破路线图摊在你面前。墨迹被雨水泡开，只剩几处符号与一行反复涂改的时间。",
+        kind: "encounter",
+        locationRoles: ["settlement", "market"],
+        durationDays: 1,
+        choices: [
+          {
+            id: "read-tracks",
+            label: "复原沿途痕迹",
+            hint: "神识与悟性有利",
+            outcomes: [
+              { weight: 7, text: "你从车辙深浅与干泥层次中辨出商队偏离了官道，最后驶向一片终年不散的湿雾。", tone: "good", result: "advance", effects: [{ type: "resource", key: "mind", amount: 4 }] },
+              { weight: 3, text: "地图越看越像一团被雨泡过的面饼。你记下几处可能的方向，只能亲自去找。", tone: "neutral", result: "advance", effects: [{ type: "resource", key: "mind", amount: -3 }] },
+            ],
+          },
+          {
+            id: "buy-rumor",
+            label: "悬赏收集传闻",
+            hint: "花费 8 灵石，稳妥查明去向",
+            requirement: { resource: { spiritStones: 8 } },
+            outcomes: [{ weight: 1, text: "几个消息贩子拼出了一条可信路线：商队最后在水泽与密林交界处出现。", tone: "good", result: "advance", effects: [{ type: "resource", key: "spiritStones", amount: -8 }] }],
+          },
+        ],
+      },
+      {
+        id: "follow-trail",
+        title: "循雾寻迹",
+        body: "商队留下的线索指向荒野深处。抵达可能的失踪地点后，才能继续追查。",
+        kind: "condition",
+        objective: { type: "visit", description: "前往药谷、水域或险地寻找商队", locationRoles: ["herbal", "water", "danger"] },
+      },
+      {
+        id: "mist-beast",
+        title: "雾中饲主",
+        body: "失踪者被困在一座废弃猎场里。雾兽循着恐惧盘旋，每次有人试图离开，它都会从白雾中扑出。",
+        kind: "encounter",
+        locationRoles: ["herbal", "water", "danger"],
+        durationDays: 2,
+        choices: [
+          {
+            id: "fight-beast",
+            label: "正面斩杀雾兽",
+            hint: "战斗判定，战力越高越有利",
+            outcomes: [
+              { weight: 6, text: "雾兽在灵光中显出真身。你斩断它与雾气的联系，幸存者终于敢沿着车辙离开。", tone: "good", result: "advance", effects: [{ type: "resource", key: "stamina", amount: -8 }, { type: "resource", key: "battlePower", amount: 2 }] },
+              { weight: 4, text: "雾兽借白雾反复袭击。你护住了被困者，却没能护住自己，猎场重新归于寂静。", tone: "danger", result: "fail", effects: [{ type: "resource", key: "stamina", amount: -24 }] },
+            ],
+          },
+          {
+            id: "break-formation",
+            label: "破坏聚雾阵眼",
+            hint: "悟性与神识有利",
+            outcomes: [
+              { weight: 7, text: "阵眼崩裂后，雾兽失去藏身之处。幸存者趁机逃出猎场，远处第一次露出天光。", tone: "mystic", result: "advance", effects: [{ type: "resource", key: "qi", amount: -12 }, { type: "resource", key: "mind", amount: 6 }] },
+              { weight: 3, text: "你触动了错误的阵纹，白雾骤然收紧。众人被迫退回原处，这条线索就此断绝。", tone: "danger", result: "fail", effects: [{ type: "resource", key: "mind", amount: -14 }] },
+            ],
+          },
+        ],
+      },
+    ],
+    completionFlag: "mist-caravan-rescued",
+    completionEffects: [{ type: "resource", key: "spiritStones", amount: 28 }, { type: "resource", key: "cultivation", amount: 36 }],
+  },
+  {
+    id: "blighted-fields",
+    title: "枯灵药田",
+    summary: "为一片正在失去灵气的药田寻找病因。",
+    offerText: "药农说田里的灵草一夜之间同时低下了头。更奇怪的是，所有根须都在朝同一个方向生长。",
+    offerRoles: ["herbal", "settlement"],
+    timeLimitDays: 18,
+    once: true,
+    weight: 1.1,
+    stages: [
+      {
+        id: "prepare-remedy",
+        title: "备齐药引",
+        body: "要找出枯败源头，需要先以新鲜灵草配出显脉药液。",
+        kind: "condition",
+        objective: { type: "resource", description: "携带并交付 3 株灵草", key: "herbs", amount: 3, consume: true, locationRoles: ["herbal", "settlement"] },
+      },
+      {
+        id: "trace-roots",
+        title: "逆根寻源",
+        body: "药液渗入土中，地下浮出密密麻麻的青色脉络。所有根须都绕开中央一块看似普通的黑石。",
+        kind: "encounter",
+        locationRoles: ["herbal", "settlement"],
+        durationDays: 2,
+        choices: [
+          {
+            id: "purify-stone",
+            label: "布阵净化黑石",
+            hint: "消耗灵力，悟性有利",
+            requirement: { resource: { qi: 10 } },
+            outcomes: [
+              { weight: 7, text: "黑石中的秽气被一层层剥离，药田重新吸入灵气，枯黄叶片缓慢舒展。", tone: "good", result: "advance", effects: [{ type: "resource", key: "qi", amount: -10 }, { type: "resource", key: "mind", amount: 5 }] },
+              { weight: 3, text: "净化阵与黑石彼此牵扯，最终同时碎裂。药田保住了，你也被反噬震得气血翻涌。", tone: "danger", result: "advance", effects: [{ type: "resource", key: "qi", amount: -10 }, { type: "resource", key: "stamina", amount: -13 }] },
+            ],
+          },
+          {
+            id: "dig-out",
+            label: "直接挖出黑石",
+            hint: "根骨有利，可能受伤",
+            outcomes: [
+              { weight: 6, text: "你连土带石挖出污染源。药田损失了一角，却保住了剩下的灵株。", tone: "good", result: "advance", effects: [{ type: "resource", key: "stamina", amount: -5 }] },
+              { weight: 4, text: "黑石裂开时喷出积蓄多年的秽气。药田得救了，你却需要很久才能忘掉那股味道。", tone: "danger", result: "advance", effects: [{ type: "resource", key: "stamina", amount: -16 }, { type: "resource", key: "mind", amount: -6 }] },
+            ],
+          },
+        ],
+      },
+    ],
+    completionEffects: [{ type: "resource", key: "herbs", amount: 7 }, { type: "resource", key: "spiritStones", amount: 12 }],
+  },
+  {
+    id: "buried-forge",
+    title: "地底炉声",
+    summary: "查明矿脉深处每夜响起的锻造声。",
+    offerText: "矿工连续七夜听见废弃矿道中有人打铁。第八夜，声音开始准确敲出他们每个人的名字。",
+    offerRoles: ["mine", "danger"],
+    minStage: 2,
+    timeLimitDays: 30,
+    once: true,
+    weight: 1,
+    stages: [
+      {
+        id: "enter-forge",
+        title: "熄火矿道",
+        body: "越往深处，岩壁越温热。尽头的古炉没有火，铁砧上却有一柄尚未完成的剑胚自行翻转。",
+        kind: "encounter",
+        locationRoles: ["mine", "danger"],
+        durationDays: 2,
+        choices: [
+          {
+            id: "answer-smith",
+            label: "回应炉中残念",
+            hint: "心境与悟性有利",
+            outcomes: [
+              { weight: 7, text: "你说出自己求道至今最不愿承认的一次失败。炉声停顿片刻，剑胚上浮现下一处火种的位置。", tone: "mystic", result: "advance", effects: [{ type: "resource", key: "mind", amount: 8 }] },
+              { weight: 3, text: "残念不接受敷衍。铁锤隔空落下，震得你识海嗡鸣，却也留下了火种方位。", tone: "danger", result: "advance", effects: [{ type: "resource", key: "mind", amount: -12 }] },
+            ],
+          },
+          {
+            id: "subdue-sword",
+            label: "以力镇压剑胚",
+            hint: "战斗判定",
+            outcomes: [
+              { weight: 5, text: "剑胚连斩十三次，终于被你按回铁砧。炉中残火化作一枚赤红印记。", tone: "good", result: "advance", effects: [{ type: "resource", key: "stamina", amount: -12 }, { type: "resource", key: "battlePower", amount: 3 }] },
+              { weight: 5, text: "剑胚最后一击贯穿护体灵光。矿道塌陷前，你只来得及带走半块炉铭。", tone: "danger", result: "fail", effects: [{ type: "resource", key: "stamina", amount: -28 }] },
+            ],
+          },
+        ],
+      },
+      {
+        id: "temper-mind",
+        title: "养成炉火",
+        body: "炉铭要求持有者拥有足够坚韧的心神，才能承受下一次开炉。",
+        kind: "condition",
+        objective: { type: "resource", description: "将心境恢复至 35 点", key: "mind", amount: 35 },
+      },
+      {
+        id: "finish-blade",
+        title: "无主之剑",
+        body: "古炉重新点燃。那道残念只问最后一个问题：这柄剑铸成之后，第一剑要斩向何处？",
+        kind: "encounter",
+        locationRoles: ["mine", "danger"],
+        durationDays: 3,
+        choices: [
+          { id: "cut-fear", label: "斩向心中畏惧", hint: "磨炼心境", outcomes: [{ weight: 1, text: "剑光没有落在任何实物上，你心中长久盘踞的阴影却缺了一角。残念含笑散去。", tone: "mystic", result: "advance", effects: [{ type: "resource", key: "mind", amount: 12 }] }] },
+          { id: "cut-enemy", label: "留待来日斩敌", hint: "增长战力", outcomes: [{ weight: 1, text: "剑胚化作一道锋芒融入你的兵刃。古炉熄灭，这次再没有留下回声。", tone: "good", result: "advance", effects: [{ type: "resource", key: "battlePower", amount: 8 }] }] },
+        ],
+      },
+    ],
+    completionFlag: "ancient-forge-awakened",
+    completionEffects: [{ type: "resource", key: "cultivation", amount: 75 }, { type: "resource", key: "spiritStones", amount: 24 }],
+  },
+  {
+    id: "rift-message",
+    title: "雾后之信",
+    summary: "追踪雾兽体内不属于此界的印记。",
+    offerText: "获救商队交出一枚从雾兽体内剥落的骨片。骨片上的纹路与你掌心的界蚀印完全一致，并在夜里指向远方。",
+    offerRoles: ["market", "settlement", "sect"],
+    requireFlag: "mist-caravan-rescued",
+    excludeFlag: "rift-message-heard",
+    timeLimitDays: 45,
+    once: true,
+    weight: 3,
+    stages: [
+      {
+        id: "follow-bone",
+        title: "骨片所指",
+        body: "骨片会在靠近界壁薄弱处时发热。你需要沿着它的指引找到下一处回响。",
+        kind: "condition",
+        objective: { type: "visit", description: "前往水域、险地、秘境或界隙", locationRoles: ["water", "danger", "secret", "rift"] },
+      },
+      {
+        id: "answer-beyond",
+        title: "界外回音",
+        body: "骨片贴上岩壁后，另一端传来一个与你声音相同的人。它说自己留在故乡，并问你是否愿意交换位置。",
+        kind: "encounter",
+        locationRoles: ["water", "danger", "secret", "rift"],
+        durationDays: 2,
+        choices: [
+          {
+            id: "refuse",
+            label: "拒绝交换",
+            hint: "守住此世身份",
+            outcomes: [{ weight: 1, text: "你说出这一世经历过的人与事。界外声音无法复述，最终承认自己只是裂隙借记忆捏出的影子。", tone: "mystic", result: "advance", effects: [{ type: "resource", key: "mind", amount: 10 }, { type: "stat", key: "insight", amount: 1 }] }],
+          },
+          {
+            id: "probe",
+            label: "假意答应，反探界外",
+            hint: "神识有利，风险较高",
+            outcomes: [
+              { weight: 6, text: "交换仪式开启的刹那，你窥见裂隙背后盘踞着一座倒悬城池。有人正在主动凿穿两界。", tone: "mystic", result: "advance", effects: [{ type: "resource", key: "cultivation", amount: 55 }] },
+              { weight: 4, text: "界外意念趁隙钻入识海。你斩断联系，却遗失了几段关于故乡的记忆。", tone: "danger", result: "advance", effects: [{ type: "resource", key: "mind", amount: -20 }] },
+            ],
+          },
+        ],
+      },
+    ],
+    completionFlag: "rift-message-heard",
+    completionEffects: [{ type: "resource", key: "cultivation", amount: 90 }, { type: "resource", key: "battlePower", amount: 5 }],
+  },
+  {
+    id: "inverted-city",
+    title: "倒悬城影",
+    summary: "追查正在从界外凿穿天地的倒悬城。",
+    offerText: "观星者发现星图上多出一座倒悬城池。它每天都会靠近一寸，而只有你掌心的界蚀印能让图上的城门开启。",
+    offerRoles: ["sect", "academy", "secret", "rift"],
+    requireFlag: "rift-message-heard",
+    minStage: 10,
+    timeLimitDays: 90,
+    once: true,
+    weight: 4,
+    stages: [
+      {
+        id: "reach-foundation",
+        title: "承受界门",
+        body: "观星者认为，至少踏入筑基层次，肉身与识海才足以承受界门开启时的挤压。",
+        kind: "condition",
+        objective: { type: "realm", description: "达到筑基一层或更高境界", minStage: 10 },
+      },
+      {
+        id: "enter-gate",
+        title: "城门倒悬",
+        body: "界蚀印与星图同时亮起，倒悬城门从天空投下阴影。披甲守门人从影中落地，宣称此界已经被登记为无主之地。",
+        kind: "encounter",
+        locationRoles: ["sect", "academy", "secret", "rift"],
+        durationDays: 4,
+        choices: [
+          {
+            id: "duel-warden",
+            label: "击败守门人",
+            hint: "高难度战斗判定",
+            outcomes: [
+              { weight: 5, text: "守门人的甲胄在你的攻势下寸寸剥落。城门第一次后退，界外有人记住了你的名字。", tone: "good", result: "advance", effects: [{ type: "resource", key: "stamina", amount: -22 }, { type: "resource", key: "battlePower", amount: 12 }] },
+              { weight: 5, text: "守门人的长戈穿透界门阴影，也贯穿了你的护体灵光。城影暂退，这条追索却只能到此为止。", tone: "danger", result: "fail", effects: [{ type: "resource", key: "stamina", amount: -45 }, { type: "resource", key: "mind", amount: -18 }] },
+            ],
+          },
+          {
+            id: "challenge-claim",
+            label: "以此世因果驳斥契书",
+            hint: "悟性、关系与历程化作证据",
+            outcomes: [
+              { weight: 7, text: "你以这一世结下的因果证明此界从不无主。契书自行燃烧，倒悬城失去了一条侵入此界的道路。", tone: "mystic", result: "advance", effects: [{ type: "resource", key: "mind", amount: 18 }, { type: "stat", key: "fortune", amount: 1 }] },
+              { weight: 3, text: "契书吞下你的言辞，又索取一段记忆作为诉讼费用。你被迫关闭界门，等待下一次机会。", tone: "danger", result: "stay", effects: [{ type: "resource", key: "mind", amount: -16 }] },
+            ],
+          },
+        ],
+      },
+    ],
+    completionFlag: "inverted-city-repelled",
+    completionEffects: [{ type: "resource", key: "cultivation", amount: 420 }, { type: "resource", key: "battlePower", amount: 20 }, { type: "stat", key: "insight", amount: 1 }],
+  },
+];
+
+export const questMap = new Map(QUESTS.map((quest) => [quest.id, quest]));

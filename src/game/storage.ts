@@ -5,13 +5,14 @@ import {
   emptyMeta,
   generateNpcs,
   generateWorld,
+  initializeQuestSystem,
   lifespanForStage,
   maxMindForStage,
   maxStaminaForStage,
   qiCapacityForStage,
 } from "./engine";
-import { REALMS, itemMap } from "./data";
-import type { AiProviderFormat, AiSettings, CoreStats, GameState, MetaProgress, Npc, SaveEnvelope } from "./types";
+import { REALMS, itemMap, traitMap } from "./data";
+import type { AiProviderFormat, AiSettings, CoreStats, GameState, MetaProgress, Npc, Resources, SaveEnvelope, TraitDefinition, TraitRarity } from "./types";
 
 const GAME_KEY = "another-world.game.v1";
 const META_KEY = "another-world.meta.v1";
@@ -23,6 +24,7 @@ export const DEFAULT_AI_SETTINGS: AiSettings = {
   apiKey: "",
   format: "openai",
   model: "gpt-4o-mini",
+  questGeneration: "manual",
 };
 
 function isGameState(value: unknown): value is GameState {
@@ -37,6 +39,12 @@ function isMeta(value: unknown): value is MetaProgress {
   return candidate.version === 1 && typeof candidate.totalInsight === "number" && Array.isArray(candidate.discoveredEvents);
 }
 
+function normalizeMeta(meta: MetaProgress): MetaProgress {
+  const completedRuns = typeof meta.completedRuns === "number" && Number.isFinite(meta.completedRuns) ? Math.max(0, Math.floor(meta.completedRuns)) : 0;
+  const storedLevel = typeof meta.simulationLevel === "number" && Number.isFinite(meta.simulationLevel) ? Math.floor(meta.simulationLevel) : 1;
+  return { ...meta, completedRuns, simulationLevel: Math.max(1, storedLevel, completedRuns + 1) };
+}
+
 function isAiSettings(value: unknown): value is AiSettings {
   if (!value || typeof value !== "object") return false;
   const candidate = value as Partial<AiSettings>;
@@ -44,7 +52,44 @@ function isAiSettings(value: unknown): value is AiSettings {
     && typeof candidate.endpoint === "string"
     && typeof candidate.apiKey === "string"
     && (candidate.format === "openai" || candidate.format === "claude")
-    && typeof candidate.model === "string";
+    && typeof candidate.model === "string"
+    && (candidate.questGeneration === undefined || candidate.questGeneration === "off" || candidate.questGeneration === "manual" || candidate.questGeneration === "continuous");
+}
+
+const TRAIT_RARITIES: TraitRarity[] = ["gray", "white", "green", "blue", "purple", "rainbow"];
+const TRAIT_STAT_KEYS: Array<keyof CoreStats> = ["constitution", "insight", "spirit", "fortune"];
+const TRAIT_RESOURCE_KEYS: Array<keyof Resources> = ["health", "maxHealth", "stamina", "maxStamina", "lifespan", "battlePower", "qi", "maxQi", "mind", "maxMind", "spiritStones", "herbs", "pills"];
+
+function normalizeTrait(value: unknown): TraitDefinition | undefined {
+  if (!value || typeof value !== "object") return undefined;
+  const source = value as Partial<TraitDefinition>;
+  if (typeof source.id !== "string" || typeof source.name !== "string" || typeof source.description !== "string") return undefined;
+  const rarity = TRAIT_RARITIES.includes(source.rarity as TraitRarity) ? source.rarity as TraitRarity : "white";
+  const cost = typeof source.cost === "number" && Number.isFinite(source.cost) ? Math.max(1, Math.min(8, Math.round(source.cost))) : 1;
+  const stats: Partial<CoreStats> = {};
+  TRAIT_STAT_KEYS.forEach((key) => {
+    const amount = source.stats?.[key];
+    if (typeof amount === "number" && Number.isFinite(amount)) stats[key] = Math.max(-3, Math.min(5, Math.round(amount)));
+  });
+  const resources: Partial<Resources> = {};
+  TRAIT_RESOURCE_KEYS.forEach((key) => {
+    const amount = source.resources?.[key];
+    if (typeof amount === "number" && Number.isFinite(amount)) resources[key] = Math.max(-300, Math.min(500, Math.round(amount)));
+  });
+  const finiteBonus = (valueToCheck: unknown) => typeof valueToCheck === "number" && Number.isFinite(valueToCheck) ? Math.max(-0.25, Math.min(0.5, valueToCheck)) : undefined;
+  return {
+    id: source.id.slice(0, 96),
+    name: source.name.trim().slice(0, 36) || "无名命格",
+    description: source.description.trim().slice(0, 180) || "一条尚未被命名的命运伏笔。",
+    rarity,
+    cost,
+    stats: Object.keys(stats).length ? stats : undefined,
+    resources: Object.keys(resources).length ? resources : undefined,
+    cultivationBonus: finiteBonus(source.cultivationBonus),
+    alchemyBonus: finiteBonus(source.alchemyBonus),
+    explorationBonus: finiteBonus(source.explorationBonus),
+    dangerModifier: finiteBonus(source.dangerModifier),
+  };
 }
 
 function normalizeGame(game: GameState): GameState {
@@ -86,7 +131,13 @@ function normalizeGame(game: GameState): GameState {
   };
   const savedOptions = game.world?.options;
   const options = savedOptions && ["small", "medium", "large", "custom"].includes(savedOptions.size) && ["calm", "balanced", "perilous"].includes(savedOptions.danger)
-    ? { ...savedOptions, locationCount: Math.max(5, Math.min(100, Math.round(savedOptions.locationCount || 7))) }
+    ? {
+      ...savedOptions,
+      locationCount: Math.max(5, Math.min(100, Math.round(savedOptions.locationCount || 7))),
+      aiContentChance: typeof savedOptions.aiContentChance === "number" && Number.isFinite(savedOptions.aiContentChance)
+        ? Math.max(0, Math.min(1, savedOptions.aiContentChance))
+        : DEFAULT_WORLD_OPTIONS.aiContentChance,
+    }
     : DEFAULT_WORLD_OPTIONS;
   const world = game.world?.locations?.length && game.world.currentLocationId
     ? { ...game.world, options }
@@ -134,12 +185,14 @@ function normalizeGame(game: GameState): GameState {
     : [];
   const npcs = savedNpcs.length ? savedNpcs : generateNpcs(game.seed, world.locations);
   const rawInventory = (game as Partial<GameState>).inventory;
+  const rawGeneratedItems = (game as Partial<GameState>).generatedItems;
+  const generatedItemIds = new Set(Array.isArray(rawGeneratedItems) ? rawGeneratedItems.flatMap((item) => item && typeof item === "object" && typeof (item as { id?: unknown }).id === "string" ? [(item as { id: string }).id] : []) : []);
   const inventory = Array.isArray(rawInventory)
     ? rawInventory.flatMap((entry) => {
       if (!entry || typeof entry !== "object") return [];
       const itemId = (entry as Partial<{ itemId: unknown }>).itemId;
       const quantity = (entry as Partial<{ quantity: unknown }>).quantity;
-      if (typeof itemId !== "string" || !itemMap.has(itemId) || typeof quantity !== "number" || !Number.isFinite(quantity)) return [];
+      if (typeof itemId !== "string" || (!itemMap.has(itemId) && !generatedItemIds.has(itemId)) || typeof quantity !== "number" || !Number.isFinite(quantity)) return [];
       const normalizedQuantity = Math.floor(quantity);
       return normalizedQuantity > 0 ? [{ itemId, quantity: normalizedQuantity }] : [];
     })
@@ -156,11 +209,26 @@ function normalizeGame(game: GameState): GameState {
     herbs: inventoryMap.get("spirit-herb") ?? 0,
     pills: inventoryMap.get("barrier-pill") ?? 0,
   };
+  const rawTraits = (game.character as Partial<GameState["character"]>).traits;
+  const character = {
+    ...game.character,
+    gender: game.character.gender === "male" || game.character.gender === "female" ? game.character.gender : "unknown",
+    traits: Array.isArray(rawTraits) ? Array.from(new Map(rawTraits.flatMap((trait) => {
+      const known = trait && typeof trait === "object" && typeof (trait as { id?: unknown }).id === "string" ? traitMap.get((trait as { id: string }).id) : undefined;
+      const normalized = known ?? normalizeTrait(trait);
+      return normalized ? [[normalized.id, normalized] as const] : [];
+    })).values()) : [],
+  } as GameState["character"];
   const travelPlan = Array.isArray(game.travelPlan)
     ? game.travelPlan.filter((id): id is string => typeof id === "string" && world.locations.some((location) => location.id === id))
     : undefined;
-  const normalized = { ...game, resources: normalizedResources, world, npcs, inventory: normalizedInventory, travelPlan: travelPlan?.length ? travelPlan : undefined } as GameState;
-  return normalized;
+  const questOffers = Array.isArray((game as Partial<GameState>).questOffers) ? game.questOffers : [];
+  const quests = Array.isArray((game as Partial<GameState>).quests) ? game.quests : [];
+  const generatedQuests = Array.isArray((game as Partial<GameState>).generatedQuests) ? game.generatedQuests : [];
+  const generatedEvents = Array.isArray((game as Partial<GameState>).generatedEvents) ? game.generatedEvents : [];
+  const generatedItems = Array.isArray((game as Partial<GameState>).generatedItems) ? game.generatedItems : [];
+  const normalized = { ...game, character, resources: normalizedResources, world, npcs, inventory: normalizedInventory, travelPlan: travelPlan?.length ? travelPlan : undefined, questOffers, quests, generatedQuests, generatedEvents, generatedItems } as GameState;
+  return initializeQuestSystem(normalized);
 }
 
 export function loadGame(): GameState | null {
@@ -177,7 +245,7 @@ export function loadMeta(): MetaProgress {
     const value = localStorage.getItem(META_KEY);
     if (!value) return emptyMeta();
     const parsed: unknown = JSON.parse(value);
-    return isMeta(parsed) ? parsed : emptyMeta();
+    return isMeta(parsed) ? normalizeMeta(parsed) : emptyMeta();
   } catch { return emptyMeta(); }
 }
 
@@ -214,5 +282,5 @@ export function importSave(raw: string): SaveEnvelope {
   const envelope = parsed as Partial<SaveEnvelope>;
   if (envelope.version !== 1 || !isMeta(envelope.meta)) throw new Error("存档版本无效或轮回数据损坏");
   if (envelope.game !== null && !isGameState(envelope.game)) throw new Error("本局数据损坏");
-  return { ...envelope, game: envelope.game ? normalizeGame(envelope.game) : null } as SaveEnvelope;
+  return { ...envelope, meta: normalizeMeta(envelope.meta), game: envelope.game ? normalizeGame(envelope.game) : null } as SaveEnvelope;
 }

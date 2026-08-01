@@ -18,6 +18,7 @@ type ProxyRequest = {
 type ProxyResponse = {
   statusCode: number;
   setHeader: (name: string, value: string | number) => void;
+  write: (chunk: Uint8Array) => void;
   end: (body?: string | Uint8Array) => void;
 };
 
@@ -47,18 +48,37 @@ async function handleAiProxy(request: ProxyRequest, response: ProxyResponse, nex
   try {
     const headers = new Headers();
     Object.entries(request.headers).forEach(([name, value]) => {
-      if (["host", "connection", "content-length"].includes(name)) return;
+      if (["host", "connection", "content-length", "accept-encoding"].includes(name)) return;
       if (typeof value === "string") headers.set(name, value);
       else if (Array.isArray(value)) headers.set(name, value.join(", "));
     });
+    // Some AI gateways negotiate zstd when the browser advertises it. Node's
+    // fetch does not consistently decode zstd, so request an identity body
+    // before streaming the response to the browser.
+    headers.set("accept-encoding", "identity");
     const body = request.method === "GET" || request.method === "HEAD" ? undefined : await readProxyBody(request);
     const upstream = await fetch(target, { method: request.method ?? "GET", headers, body: body as unknown as BodyInit });
     response.statusCode = upstream.status;
     upstream.headers.forEach((value, name) => {
-      if (!["content-length", "connection", "transfer-encoding"].includes(name)) response.setHeader(name, value);
+      // Node fetch transparently decompresses upstream bodies. Forwarding the
+      // original encoding header would make the browser try to decompress it a
+      // second time and fail with ERR_CONTENT_DECODING_FAILED.
+      if (!["content-length", "content-encoding", "connection", "transfer-encoding"].includes(name)) response.setHeader(name, value);
     });
     response.setHeader("access-control-allow-origin", "*");
-    response.end(new Uint8Array(await upstream.arrayBuffer()));
+    if (upstream.body) {
+      const reader = upstream.body.getReader();
+      try {
+        while (true) {
+          const chunk = await reader.read();
+          if (chunk.done) break;
+          response.write(chunk.value);
+        }
+      } finally {
+        reader.releaseLock();
+      }
+    }
+    response.end();
   } catch (error) {
     response.statusCode = 502;
     response.setHeader("content-type", "application/json");

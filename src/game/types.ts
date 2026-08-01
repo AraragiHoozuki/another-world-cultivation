@@ -22,6 +22,9 @@ export type ItemRarity = 1 | 2 | 3 | 4 | 5 | 6 | 7 | 8 | 9;
 export type ItemCategory = "consumable" | "material" | "artifact" | "quest";
 
 export type AiProviderFormat = "openai" | "claude";
+export type AiQuestGenerationMode = "off" | "manual" | "continuous";
+export type CharacterGender = "male" | "female" | "unknown";
+export type TraitRarity = "gray" | "white" | "green" | "blue" | "purple" | "rainbow";
 
 export interface AiSettings {
   enabled: boolean;
@@ -29,6 +32,7 @@ export interface AiSettings {
   apiKey: string;
   format: AiProviderFormat;
   model: string;
+  questGeneration: AiQuestGenerationMode;
 }
 
 export interface AiGeneratedOutcome {
@@ -46,6 +50,8 @@ export interface WorldOptions {
   size: WorldSize;
   danger: WorldDanger;
   locationCount: number;
+  /** Probability (0-1) that a completed event prompts continuous AI content generation. */
+  aiContentChance?: number;
 }
 
 export interface CoreStats {
@@ -131,12 +137,28 @@ export interface CharacterCandidate {
   resources: Resources;
 }
 
+export interface TraitDefinition {
+  id: string;
+  name: string;
+  description: string;
+  rarity: TraitRarity;
+  cost: number;
+  stats?: Partial<CoreStats>;
+  resources?: Partial<Resources>;
+  cultivationBonus?: number;
+  alchemyBonus?: number;
+  explorationBonus?: number;
+  dangerModifier?: number;
+}
+
 export interface Character {
   name: string;
+  gender: CharacterGender;
   origin: OriginDefinition;
   spiritRoot: SpiritRootDefinition;
   talent: TalentDefinition;
   stats: CoreStats;
+  traits: TraitDefinition[];
 }
 
 export type NpcIdentity = "wanderer" | "sect" | "merchant" | "alchemist" | "hunter" | "hermit" | "artisan";
@@ -234,13 +256,22 @@ export interface EventResultChange {
   amount: number;
 }
 
+export interface GeneratedContentSummary {
+  locations: string[];
+  npcs: string[];
+  quests: string[];
+  events: string[];
+  items: string[];
+}
+
 export interface EventResult {
-  kind?: "event" | "action";
+  kind?: "event" | "action" | "quest";
   title: string;
   text: string;
   tone: Tone;
   changes: EventResultChange[];
   durationDays?: number;
+  generatedContent?: GeneratedContentSummary;
 }
 
 export interface EventChoice {
@@ -267,6 +298,109 @@ export interface EventDefinition {
   excludeFlag?: string;
   locationRoles?: LocationRole[];
   durationDays?: number;
+}
+
+export type QuestStatus = "active" | "completed" | "failed" | "abandoned";
+export type QuestStageKind = "condition" | "encounter";
+export type QuestStageResult = "advance" | "stay" | "fail";
+
+export type QuestObjective =
+  | { type: "visit"; description: string; locationRoles: LocationRole[] }
+  | { type: "resource"; description: string; key: ResourceKey; amount: number; consume?: boolean; locationRoles?: LocationRole[] }
+  | { type: "realm"; description: string; minStage: number };
+
+export interface QuestOutcome extends EventOutcome {
+  result?: QuestStageResult;
+}
+
+export interface QuestChoice {
+  id: string;
+  label: string;
+  hint: string;
+  requirement?: Requirement;
+  outcomes: QuestOutcome[];
+}
+
+export interface QuestStageDefinition {
+  id: string;
+  title: string;
+  body: string;
+  kind: QuestStageKind;
+  locationRoles?: LocationRole[];
+  objective?: QuestObjective;
+  choices?: QuestChoice[];
+  durationDays?: number;
+}
+
+export interface QuestDefinition {
+  id: string;
+  title: string;
+  summary: string;
+  offerText: string;
+  offerRoles: LocationRole[];
+  stages: QuestStageDefinition[];
+  timeLimitDays?: number;
+  minStage?: number;
+  maxStage?: number;
+  requireFlag?: string;
+  excludeFlag?: string;
+  completionFlag?: string;
+  completionEffects?: Effect[];
+  failureEffects?: Effect[];
+  weight?: number;
+  once?: boolean;
+}
+
+export interface QuestOffer {
+  questId: string;
+  locationId: string;
+  discoveredTurn: number;
+  expiresTurn: number;
+}
+
+export interface QuestProgress {
+  questId: string;
+  status: QuestStatus;
+  stageIndex: number;
+  acceptedTurn: number;
+  updatedTurn: number;
+  deadlineTurn?: number;
+  finishedTurn?: number;
+  failureReason?: string;
+}
+
+export interface AiQuestGenerationTrigger {
+  kind: "action" | "event" | "quest" | "travel" | "npc" | "manual";
+  title: string;
+  text: string;
+  locationName?: string;
+  tone?: Tone;
+}
+
+export interface AiGeneratedQuestBundle {
+  quests: QuestDefinition[];
+  narrative?: string;
+}
+
+export interface AiGeneratedLocationDraft {
+  id: string;
+  role: LocationRole;
+  name: string;
+  subtitle: string;
+  description: string;
+  danger: WorldLocation["danger"];
+  icon: WorldLocation["icon"];
+  actions: ActionId[];
+  modifiers?: LocationModifiers;
+  unlockStage?: number;
+  travelCost?: number;
+}
+
+export interface AiGeneratedContentBundle extends AiGeneratedQuestBundle {
+  events: EventDefinition[];
+  locations: AiGeneratedLocationDraft[];
+  items: ItemDefinition[];
+  npcs: Npc[];
 }
 
 export interface WorldLocation {
@@ -307,7 +441,7 @@ export interface ChronicleEntry {
   title: string;
   text: string;
   tone: Tone;
-  kind?: "event" | "action";
+  kind?: "event" | "action" | "quest";
   detail?: string;
   locationName?: string;
   changes?: EventResultChange[];
@@ -340,6 +474,16 @@ export interface GameState {
   flags: string[];
   seenEvents: Record<string, number>;
   pendingEventId?: string;
+  questOffers: QuestOffer[];
+  quests: QuestProgress[];
+  /** AI-authored quest definitions retained with this life/save. */
+  generatedQuests: QuestDefinition[];
+  /** AI-authored events/items retained with this life/save. */
+  generatedEvents: EventDefinition[];
+  generatedItems: ItemDefinition[];
+  /** Last in-game day on which continuous AI world generation completed. */
+  aiContentLastTurn?: number;
+  pendingQuestId?: string;
   /** Remaining destination ids for an automatically planned multi-hop journey. */
   travelPlan?: string[];
   eventResult?: EventResult;
@@ -352,6 +496,8 @@ export interface MetaProgress {
   version: 1;
   totalInsight: number;
   completedRuns: number;
+  /** Unlock level for the starting trait draft. Older saves may omit it. */
+  simulationLevel?: number;
   victories: number;
   discoveredEvents: string[];
   bestScore: number;

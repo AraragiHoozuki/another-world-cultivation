@@ -40,6 +40,9 @@ import {
   Store,
   Star,
   Swords,
+  Moon,
+  Sun,
+  Target,
   Trees,
   UserRound,
   Users,
@@ -49,13 +52,16 @@ import {
   X,
   type LucideIcon,
 } from "lucide-react";
-import { ACTIONS, ITEM_CATEGORY_NAMES, ITEM_RARITY_NAMES, ITEMS, NPC_IDENTITIES, NPC_INTERACTIONS, REALMS, itemMap } from "./game/data";
+import { ACTIONS, ITEM_CATEGORY_NAMES, ITEM_RARITY_NAMES, NPC_IDENTITIES, NPC_INTERACTIONS, REALMS, TRAIT_RARITY_NAMES, traitMap } from "./game/data";
 import {
   fetchAiModels,
   isAiConfigured,
   requestAiAction,
+  requestAiContent,
   requestAiEvent,
   requestAiNpcInteraction,
+  requestAiQuest,
+  requestAiStartingTraits,
   requestAiTravel,
 } from "./game/ai";
 import {
@@ -66,13 +72,29 @@ import {
   canTravel,
   claimLegacy,
   createCandidates,
+  createTraitOptions,
   getBreakthroughInfo,
   getCurrentEvent,
+  getCurrentQuestStage,
+  getQuestStage,
+  getQuestDefinition,
   getCurrentLocation,
+  getItem,
+  getItems,
   getItemQuantity,
   getTravelPath,
   getLocationModifiers,
   getLocationNpcs,
+  getSimulationProgression,
+  getLocationQuestOffers,
+  canAcceptQuest,
+  acceptQuest,
+  canAdvanceQuest,
+  advanceQuest,
+  abandonQuest,
+  addGeneratedContent,
+  resolveQuestStage,
+  resolveQuestStageWithAi,
   getNpcRelationshipLabel,
   getNpcSpecialRelationshipLabel,
   canInteractWithNpc,
@@ -89,6 +111,7 @@ import {
   performAction,
   resolveEvent,
   resolveEventWithAi,
+  rollAiContentChance,
   startGame,
   toggleNpcAttention,
   travelTo,
@@ -97,10 +120,22 @@ import {
   useItem,
 } from "./game/engine";
 import { exportSave, importSave, loadAiSettings, loadGame, loadMeta, saveAiSettings, saveGame, saveMeta } from "./game/storage";
-import type { ActionDefinition, ActionId, AiSettings, CharacterCandidate, ChronicleEntry, EventResult, GameState, ItemCategory, ItemDefinition, MetaProgress, Npc, NpcInteractionId, NpcRelationshipType, ResourceKey, Tone, WorldLocation, WorldOptions } from "./game/types";
+import type { ActionDefinition, ActionId, AiQuestGenerationTrigger, AiSettings, CharacterCandidate, CharacterGender, ChronicleEntry, EventResult, GameState, ItemCategory, ItemDefinition, MetaProgress, Npc, NpcInteractionId, NpcRelationshipType, QuestChoice, QuestDefinition, QuestProgress, QuestStageDefinition, ResourceKey, Tone, TraitDefinition, WorldLocation, WorldOptions } from "./game/types";
 
 type Screen = "welcome" | "create" | "game";
-type MobileTab = "journey" | "map" | "npcs" | "inventory" | "character" | "actions" | "legacy";
+type MobileTab = "journey" | "map" | "npcs" | "quests" | "inventory" | "character" | "actions" | "legacy";
+type ThemeMode = "light" | "dark";
+
+const THEME_STORAGE_KEY = "another-world.theme";
+
+function loadTheme(): ThemeMode {
+  if (typeof window === "undefined") return "dark";
+  try {
+    return window.localStorage.getItem(THEME_STORAGE_KEY) === "light" ? "light" : "dark";
+  } catch {
+    return "dark";
+  }
+}
 
 const actionIcons: Record<ActionId, LucideIcon> = {
   cultivate: CloudMoon,
@@ -210,7 +245,7 @@ function WelcomeScreen({ game, meta, onContinue, onCreate, onManage }: { game: G
           {game && <button className="primary-command" type="button" onClick={onContinue}><ScrollText size={19} /><span>续写此生</span><ChevronRight size={18} /></button>}
           <button className={game ? "secondary-command" : "primary-command"} type="button" onClick={onCreate}><Sparkles size={18} /><span>另启轮回</span></button>
         </div>
-        <div className="legacy-line"><History size={15} /><span>轮回见闻 {meta.totalInsight}</span><i /> <span>已历 {meta.completedRuns} 世</span></div>
+        <div className="legacy-line"><History size={15} /><span>轮回见闻 {meta.totalInsight}</span><i /><span>模拟等级 Lv.{meta.simulationLevel ?? meta.completedRuns + 1}</span><i /><span>已历 {meta.completedRuns} 世</span></div>
       </section>
       <p className="welcome-quote">“此界不问来处，只问你能走多远。”</p>
     </main>
@@ -231,21 +266,91 @@ function CandidateCard({ candidate, selected, onSelect }: { candidate: Character
   );
 }
 
-function CreationScreen({ meta, onBack, onStart }: { meta: MetaProgress; onBack: () => void; onStart: (candidate: CharacterCandidate, name: string, seed: number, worldOptions: WorldOptions) => void }) {
+function CreationScreen({ meta, aiSettings, onBack, onStart }: { meta: MetaProgress; aiSettings: AiSettings; onBack: () => void; onStart: (candidate: CharacterCandidate, name: string, seed: number, worldOptions: WorldOptions, gender: CharacterGender, traits: TraitDefinition[]) => void }) {
   const [seed, setSeed] = useState(randomSeed);
-  const [refreshes, setRefreshes] = useState(1);
   const [selected, setSelected] = useState(0);
   const [name, setName] = useState("");
-  const [worldOptions, setWorldOptions] = useState<WorldOptions>({ size: "medium", danger: "balanced", locationCount: 7 });
+  const [gender, setGender] = useState<CharacterGender>("unknown");
+  const [traitRoll, setTraitRoll] = useState(0);
+  const [selectedTraitIds, setSelectedTraitIds] = useState<string[]>([]);
+  const [aiTraitEnabled, setAiTraitEnabled] = useState(false);
+  const [aiTraitOptions, setAiTraitOptions] = useState<TraitDefinition[] | undefined>();
+  const [aiTraitLoading, setAiTraitLoading] = useState(false);
+  const [aiTraitNotice, setAiTraitNotice] = useState("");
+  const progression = getSimulationProgression(meta);
+  const traitAiSettings = { ...aiSettings, enabled: true };
+  const aiTraitAvailable = isAiConfigured(traitAiSettings);
+  const [remainingCost, setRemainingCost] = useState(progression.startingCost);
+  const [worldOptions, setWorldOptions] = useState<WorldOptions>({ size: "medium", danger: "balanced", locationCount: 7, aiContentChance: 0.3 });
   const candidates = useMemo(() => createCandidates(seed, meta), [seed, meta]);
+  const localTraitOptions = useMemo(() => createTraitOptions(seed + traitRoll * 104729, meta), [seed, traitRoll, meta]);
+  const traitOptions = aiTraitOptions?.length ? aiTraitOptions : localTraitOptions;
+  const selectedTraits = selectedTraitIds.flatMap((id) => {
+    const trait = traitOptions.find((candidateTrait) => candidateTrait.id === id) ?? traitMap.get(id);
+    return trait ? [trait] : [];
+  });
   const randomName = () => {
     const surnames = ["沈", "陆", "顾", "闻", "江", "宁", "楚", "谢", "林", "苏"];
     const given = ["长安", "照夜", "归尘", "问舟", "无咎", "青崖", "见微", "怀真", "知白", "临渊"];
     setName(surnames[Math.floor(Math.random() * surnames.length)] + given[Math.floor(Math.random() * given.length)]);
   };
-  const refresh = () => {
-    if (refreshes <= 0) return;
-    setSeed(randomSeed()); setRefreshes((value) => value - 1); setSelected(0);
+  const clearSelectedTraits = () => {
+    const refund = selectedTraits.reduce((sum, trait) => sum + trait.cost, 0);
+    if (refund > 0) setRemainingCost((current) => current + refund);
+    setSelectedTraitIds([]);
+  };
+  const generateAiTraits = async (roll = traitRoll, candidate = candidates[selected]) => {
+    if (!candidate || !aiTraitAvailable) {
+      setAiTraitNotice("请先在设置中启用并完整配置 AI，当前继续使用本地词条。");
+      setAiTraitOptions(undefined);
+      return;
+    }
+    setAiTraitLoading(true);
+    setAiTraitNotice("");
+    try {
+      const generated = await requestAiStartingTraits(traitAiSettings, candidate, progression.level, progression.optionCount, seed + roll * 104729);
+      setAiTraitOptions(generated);
+      setAiTraitNotice(`AI 已生成 ${generated.length} 条开局词条，可继续按 Cost 选择。`);
+    } catch (error) {
+      setAiTraitOptions(undefined);
+      setAiTraitNotice(`AI 词条生成失败，已回退本地候选${error instanceof Error ? `：${error.message}` : ""}`);
+    } finally {
+      setAiTraitLoading(false);
+    }
+  };
+  const toggleAiTraits = (enabled: boolean) => {
+    if (aiTraitLoading) return;
+    clearSelectedTraits();
+    setAiTraitEnabled(enabled);
+    setAiTraitNotice("");
+    if (!enabled) {
+      setAiTraitOptions(undefined);
+      return;
+    }
+    setAiTraitOptions(undefined);
+    void generateAiTraits();
+  };
+  const toggleTrait = (trait: TraitDefinition) => {
+    if (aiTraitLoading) return;
+    if (selectedTraitIds.includes(trait.id)) {
+      setSelectedTraitIds((current) => current.filter((id) => id !== trait.id));
+      setRemainingCost((current) => current + trait.cost);
+      return;
+    }
+    if (remainingCost < trait.cost) return;
+    setSelectedTraitIds((current) => [...current, trait.id]);
+    setRemainingCost((current) => current - trait.cost);
+  };
+  const refreshTraits = () => {
+    if (aiTraitLoading) return;
+    const refund = selectedTraits.reduce((sum, trait) => sum + trait.cost, 0);
+    if (remainingCost + refund < progression.refreshCost) return;
+    setRemainingCost((current) => current + refund - progression.refreshCost);
+    setSelectedTraitIds([]);
+    const nextRoll = traitRoll + 1;
+    setTraitRoll(nextRoll);
+    setAiTraitOptions(undefined);
+    if (aiTraitEnabled) void generateAiTraits(nextRoll);
   };
   return (
     <main className="creation-screen">
@@ -259,17 +364,25 @@ function CreationScreen({ meta, onBack, onStart }: { meta: MetaProgress; onBack:
         <label htmlFor="cultivator-name">道友名讳</label>
         <div><input id="cultivator-name" maxLength={8} placeholder="无名亦可" value={name} onChange={(event) => setName(event.target.value)} /><IconButton label="随机姓名" icon={Dices} onClick={randomName} /></div>
       </section>
-      <div className="candidate-toolbar"><span>三道命途，择其一</span><button className="text-button" type="button" disabled={!refreshes} onClick={refresh}><RefreshCw size={16} />重观命数 {refreshes}/1</button></div>
+      <div className="candidate-toolbar"><span>三道基础命格，择其一</span><span className="simulation-level-mark">模拟等级 · Lv.{progression.level}</span></div>
       <section className="candidate-grid">
         {candidates.map((candidate, index) => <CandidateCard key={candidate.id} candidate={candidate} selected={index === selected} onSelect={() => setSelected(index)} />)}
       </section>
+      <section className="trait-draft" aria-labelledby="trait-draft-title">
+        <header className="trait-draft-header"><div><span className="eyebrow">命运筹码 · 初始状态</span><h2 id="trait-draft-title">选择初始词条</h2><p>每条词条都会影响你醒来时的状态。消耗 Cost 选择，也可以用 Cost 刷新候选。AI 辅助只会改变候选文案与小幅加成。</p></div><div className="trait-draft-tools"><div className="trait-cost"><span>剩余 Cost</span><strong>{remainingCost}</strong></div><label className={`trait-ai-toggle ${!aiTraitAvailable ? "unavailable" : ""}`} title={!aiTraitAvailable ? "请先在设置中填写 API 地址、Key 和模型" : "使用 AI 生成本轮开局词条候选"}><input type="checkbox" checked={aiTraitEnabled} disabled={aiTraitLoading || !aiTraitAvailable} onChange={(event) => toggleAiTraits(event.target.checked)} /><Bot size={16} /><span>AI 辅助</span></label></div></header>
+        <div className="trait-toolbar"><span>{aiTraitLoading ? "AI 正在生成词条…" : `已选 ${selectedTraits.length} 条 · 本轮提供 ${traitOptions.length} 条`}</span><button className="text-button" type="button" disabled={aiTraitLoading || remainingCost + selectedTraits.reduce((sum, trait) => sum + trait.cost, 0) < progression.refreshCost} onClick={refreshTraits}><RefreshCw size={16} className={aiTraitLoading ? "spin" : ""} />{aiTraitEnabled ? "AI 重新生成" : "刷新词条"} · {progression.refreshCost} Cost</button></div>
+        {aiTraitNotice && <p className="trait-ai-notice" role="status">{aiTraitNotice}</p>}
+        <div className="trait-grid">{traitOptions.map((trait) => { const selectedTrait = selectedTraitIds.includes(trait.id); const disabled = !selectedTrait && remainingCost < trait.cost; return <button key={trait.id} type="button" className={`trait-card trait-${trait.rarity} ${selectedTrait ? "selected" : ""}`} disabled={disabled || aiTraitLoading} onClick={() => toggleTrait(trait)} aria-pressed={selectedTrait}><div className="trait-card-top"><span>{TRAIT_RARITY_NAMES[trait.rarity]}</span><strong>{trait.cost} Cost</strong></div><h3>{trait.name}</h3><p>{trait.description}</p><small>{selectedTrait ? "已纳入初始命格" : disabled ? "Cost 不足" : "点击选择"}</small></button>; })}</div>
+      </section>
       <section className="world-options" aria-label="世界设定">
+        <div className="world-option-group"><div><b>主角性别</b><small>影响称谓、人物关系和部分叙事表现</small></div><div className="option-segments"><button type="button" className={gender === "male" ? "selected" : ""} onClick={() => setGender("male")}><b>男性</b><small>阳</small></button><button type="button" className={gender === "female" ? "selected" : ""} onClick={() => setGender("female")}><b>女性</b><small>阴</small></button><button type="button" className={gender === "unknown" ? "selected" : ""} onClick={() => setGender("unknown")}><b>不定</b><small>由故事决定</small></button></div></div>
         <div className="world-option-group"><div><b>世界规模</b><small>地点越多，探索路线越长</small></div><div className="option-segments">{([['small', '小型', '5 处地点', 5], ['medium', '标准', '7 处地点', 7], ['large', '广阔', '9 处地点', 9]] as const).map(([value, label, hint, count]) => <button key={value} type="button" className={worldOptions.size === value ? "selected" : ""} onClick={() => setWorldOptions({ ...worldOptions, size: value, locationCount: count })}><b>{label}</b><small>{hint}</small></button>)}</div><label className="location-count-field">自定义地点数量<input type="number" min={5} max={100} value={worldOptions.locationCount} onChange={(event) => setWorldOptions({ ...worldOptions, size: "custom", locationCount: Math.max(5, Math.min(100, Number(event.target.value) || 5)) })} /><span>5 - 100</span></label></div>
         <div className="world-option-group"><div><b>凶险程度</b><small>影响突发事件出现频率</small></div><div className="option-segments">{([['calm', '清平', '事件较少'], ['balanced', '常态', '平衡体验'], ['perilous', '险世', '事件频繁']] as const).map(([value, label, hint]) => <button key={value} type="button" className={worldOptions.danger === value ? "selected" : ""} onClick={() => setWorldOptions((current) => ({ ...current, danger: value }))}><b>{label}</b><small>{hint}</small></button>)}</div></div>
+        <div className="world-option-group ai-chance-option"><div><b>AI 世界异动概率</b><small>事件完成后，AI 创作新内容的概率</small></div><label className="ai-chance-field"><input type="range" min={0} max={100} step={5} value={Math.round((worldOptions.aiContentChance ?? 0.3) * 100)} onChange={(event) => setWorldOptions((current) => ({ ...current, aiContentChance: Number(event.target.value) / 100 }))} /><strong>{Math.round((worldOptions.aiContentChance ?? 0.3) * 100)}%</strong></label></div>
       </section>
       <footer className="creation-footer">
-        <div><History size={16} /><span>轮回见闻 {meta.totalInsight}</span><small>见闻会让新的命格浮现</small></div>
-        <button className="primary-command" type="button" onClick={() => onStart(candidates[selected], name, seed, worldOptions)}><Sparkles size={18} /><span>坠入异界</span><ChevronRight size={18} /></button>
+        <div><History size={16} /><span>轮回见闻 {meta.totalInsight} · 模拟等级 {progression.level}</span><small>词条数量、Cost 和稀有度会随轮回成长</small></div>
+        <button className="primary-command" type="button" onClick={() => onStart(candidates[selected], name, seed, worldOptions, gender, selectedTraits)}><Sparkles size={18} /><span>坠入异界</span><ChevronRight size={18} /></button>
       </footer>
     </main>
   );
@@ -279,7 +392,7 @@ function StatPanel({ game }: { game: GameState }) {
   return (
     <section className="side-section character-panel">
       <div className="portrait"><UserRound size={32} /><span>{game.realmStage}</span></div>
-      <div className="identity"><h2>{game.character.name}</h2><p>{game.character.origin.name} · {game.character.spiritRoot.name}</p><span>{game.character.talent.name}</span></div>
+      <div className="identity"><h2>{game.character.name}</h2><p>{game.character.gender === "male" ? "男性" : game.character.gender === "female" ? "女性" : "性别未定"} · {game.character.origin.name} · {game.character.spiritRoot.name}</p><span>{game.character.talent.name}</span></div>
       <div className="realm-label"><span>{REALMS[game.realmStage - 1]}</span><small>{game.realmStage < REALMS.length ? `下一境界：${REALMS[game.realmStage]}` : "已至羽化飞升"}</small></div>
       <ProgressBar label="体力" value={game.resources.stamina} max={game.resources.maxStamina} tone="red" />
       <ProgressBar label="灵力" value={game.resources.qi} max={game.resources.maxQi} tone="blue" />
@@ -289,6 +402,7 @@ function StatPanel({ game }: { game: GameState }) {
       <div className="stat-grid">
         {Object.entries(game.character.stats).map(([key, value]) => <div key={key}><span>{statNames[key as keyof typeof statNames]}</span><strong>{value}</strong></div>)}
       </div>
+      {game.character.traits?.length > 0 && <div className="character-trait-list"><span>初始词条</span><div>{game.character.traits.map((trait) => <b key={trait.id} className={`trait-text-${trait.rarity}`} title={trait.description}>{trait.name}</b>)}</div></div>}
       {game.statuses.length > 0 && <div className="status-list">{game.statuses.map((status) => <span key={status.id} title={status.description}>{status.name} · {status.remaining}天</span>)}</div>}
     </section>
   );
@@ -298,7 +412,7 @@ function InventoryPanel({ game, onUseItem, onGiftItem }: { game: GameState; onUs
   const resources: Array<{ key: ResourceKey; icon: LucideIcon; label: string; detail: string }> = [
     { key: "spiritStones", icon: Sparkles, label: "灵石", detail: "坊市通货" },
   ];
-  const ownedItems = (game.inventory ?? []).map((entry) => ({ item: itemMap.get(entry.itemId), quantity: entry.quantity })).filter((entry): entry is { item: ItemDefinition; quantity: number } => Boolean(entry.item));
+  const ownedItems = (game.inventory ?? []).map((entry) => ({ item: getItem(game, entry.itemId), quantity: entry.quantity })).filter((entry): entry is { item: ItemDefinition; quantity: number } => Boolean(entry.item));
   const interactive = Boolean(onUseItem || onGiftItem);
   const groupedItems = itemCategoryOrder.map((category) => ({ category, items: ownedItems.filter(({ item }) => item.category === category) })).filter((group) => group.items.length > 0);
   const renderItem = ({ item, quantity }: { item: ItemDefinition; quantity: number }) => {
@@ -324,8 +438,8 @@ function InventoryPanel({ game, onUseItem, onGiftItem }: { game: GameState; onUs
 }
 
 function MarketDialog({ game, onClose, onListen, onBuy, onSell }: { game: GameState; onClose: () => void; onListen: () => void; onBuy: (itemId: string) => void; onSell: (itemId: string) => void }) {
-  const buyableItems = ITEMS.filter((item) => item.category !== "quest");
-  const ownedItems = (game.inventory ?? []).map((entry) => ({ item: itemMap.get(entry.itemId), quantity: entry.quantity })).filter((entry): entry is { item: ItemDefinition; quantity: number } => {
+  const buyableItems = getItems(game).filter((item) => item.category !== "quest");
+  const ownedItems = (game.inventory ?? []).map((entry) => ({ item: getItem(game, entry.itemId), quantity: entry.quantity })).filter((entry): entry is { item: ItemDefinition; quantity: number } => {
     const { item, quantity } = entry;
     return item !== undefined && quantity > 0 && item.category !== "quest" && item.sellPrice > 0;
   });
@@ -363,7 +477,7 @@ function LegacyPanel({ meta }: { meta: MetaProgress }) {
     <section className="side-section legacy-panel">
       <h3><History size={17} />轮回见闻</h3>
       <div className="legacy-total"><strong>{meta.totalInsight}</strong><span>点见闻</span></div>
-      <dl><div><dt>已结束此世</dt><dd>{meta.completedRuns}</dd></div><div><dt>最高境界记录</dt><dd>{meta.victories}</dd></div><div><dt>最高评分</dt><dd>{meta.bestScore}</dd></div><div><dt>所见异闻</dt><dd>{meta.discoveredEvents.length}</dd></div></dl>
+      <dl><div><dt>已结束此世</dt><dd>{meta.completedRuns}</dd></div><div><dt>模拟等级</dt><dd>Lv.{meta.simulationLevel ?? meta.completedRuns + 1}</dd></div><div><dt>最高境界记录</dt><dd>{meta.victories}</dd></div><div><dt>最高评分</dt><dd>{meta.bestScore}</dd></div><div><dt>所见异闻</dt><dd>{meta.discoveredEvents.length}</dd></div></dl>
     </section>
   );
 }
@@ -372,7 +486,73 @@ function SimulationDetailsDialog({ game, meta, onClose }: { game: GameState; met
   return <div className="modal-backdrop details-modal-backdrop" role="presentation" onMouseDown={(event) => { if (event.target === event.currentTarget) onClose(); }}><section className="dialog details-dialog" role="dialog" aria-modal="true" aria-labelledby="details-dialog-title"><header><div><span className="eyebrow">本次模拟</span><h2 id="details-dialog-title">本次模拟详情</h2></div><IconButton label="关闭模拟详情" icon={X} onClick={onClose} /></header><div className="details-panels"><GoalPanel game={game} /><LegacyPanel meta={meta} /></div></section></div>;
 }
 
-function WorldMap({ game, onTravel, onAction, onMarket, onBreakthrough, showActions, onShowActionsChange }: { game: GameState; onTravel: (locationId: string) => void; onAction: (id: ActionId, durationDays?: number) => void; onMarket: () => void; onBreakthrough: () => void; showActions: boolean; onShowActionsChange: (open: boolean) => void }) {
+function questDeadlineLabel(game: GameState, progress: QuestProgress): string {
+  if (progress.deadlineTurn === undefined) return "无期限";
+  const remaining = progress.deadlineTurn - game.turn;
+  return remaining >= 0 ? `余 ${remaining} 天` : "已逾期";
+}
+
+function QuestOfferCard({ game, quest, onAccept }: { game: GameState; quest: QuestDefinition; onAccept: (questId: string) => void }) {
+  const access = canAcceptQuest(game, quest.id);
+  return <article className="quest-card quest-offer-card">
+    <div className="quest-card-heading"><span className="quest-kind-badge">可接取</span><span className="quest-card-deadline">{quest.timeLimitDays ? `限时 ${quest.timeLimitDays} 天` : "开放委托"}</span></div>
+    <h3>{quest.title}</h3>
+    <p>{quest.offerText}</p>
+    <div className="quest-card-footer"><span>{quest.stages.length} 个阶段 · {quest.summary}</span><button className="primary-command" type="button" disabled={!access.allowed} title={access.reason} onClick={() => onAccept(quest.id)}><ScrollText size={15} />接取</button></div>
+  </article>;
+}
+
+function ActiveQuestCard({ game, progress, quest, onAdvance, onAbandon }: { game: GameState; progress: QuestProgress; quest: QuestDefinition; onAdvance: (questId: string) => void; onAbandon: (questId: string) => void }) {
+  const stage = quest.stages[progress.stageIndex];
+  if (!stage) return null;
+  const access = canAdvanceQuest(game, quest.id);
+  const objective = stage.objective?.description ?? (stage.kind === "encounter" ? "抵达指定地点后推进此阶段" : stage.body);
+  return <article className="quest-card quest-active-card">
+    <div className="quest-card-heading"><span className="quest-kind-badge active">进行中</span><span className={`quest-card-deadline ${progress.deadlineTurn !== undefined && progress.deadlineTurn - game.turn <= 5 ? "urgent" : ""}`}>{questDeadlineLabel(game, progress)}</span></div>
+    <h3>{quest.title}</h3>
+    <p className="quest-stage-label">阶段 {Math.min(progress.stageIndex + 1, quest.stages.length)} / {quest.stages.length} · {stage.title}</p>
+    <p>{objective}</p>
+    <div className="quest-card-footer"><button className="danger-command quest-abandon-button" type="button" onClick={() => onAbandon(quest.id)}><X size={14} />放弃</button><button className="primary-command" type="button" disabled={!access.allowed} title={access.reason} onClick={() => onAdvance(quest.id)}><Route size={15} />{stage.kind === "encounter" ? "推进任务" : "检查进度"}</button></div>
+  </article>;
+}
+
+function QuestPanel({ game, onAccept, onAdvance, onAbandon, onGenerateContent, aiGenerationEnabled, aiGenerating }: { game: GameState; onAccept: (questId: string) => void; onAdvance: (questId: string) => void; onAbandon: (questId: string) => void; onGenerateContent?: () => void; aiGenerationEnabled?: boolean; aiGenerating?: boolean }) {
+  const offers = getLocationQuestOffers(game);
+  const active = game.quests.filter((progress) => progress.status === "active").flatMap((progress) => {
+    const quest = getQuestDefinition(game, progress.questId);
+    return quest ? [{ progress, quest }] : [];
+  });
+  const history = game.quests.filter((progress) => progress.status !== "active").slice().reverse().slice(0, 8).flatMap((progress) => {
+    const quest = getQuestDefinition(game, progress.questId);
+    return quest ? [{ progress, quest }] : [];
+  });
+  return <section className="quest-journal side-section" aria-labelledby="quest-journal-title">
+    <header className="quest-journal-header"><div><span className="eyebrow">委托与因果</span><h2 id="quest-journal-title">任务日志</h2></div><div className="quest-journal-tools"><span className="quest-count"><ScrollText size={16} />{active.length} / 4</span><button className="secondary-command quest-generate-button" type="button" disabled={!aiGenerationEnabled || aiGenerating} title={aiGenerationEnabled ? "让 AI 开拓新的地点、事件、任务、物品与人物" : "请先在设置中启用并配置 AI"} onClick={onGenerateContent}><Sparkles size={15} />{aiGenerating ? "生成中" : "开拓世界"}</button></div></header>
+    {offers.length > 0 && <section className="quest-group"><div className="quest-group-heading"><h3>此地传来的委托</h3><small>{getCurrentLocation(game).name}</small></div><div className="quest-list">{offers.map(({ quest }) => <QuestOfferCard key={quest.id} game={game} quest={quest} onAccept={onAccept} />)}</div></section>}
+    <section className="quest-group"><div className="quest-group-heading"><h3>进行中的任务</h3><small>{active.length ? "按阶段推进" : "尚无追踪中的任务"}</small></div>{active.length > 0 ? <div className="quest-list">{active.map(({ progress, quest }) => <ActiveQuestCard key={quest.id} game={game} progress={progress} quest={quest} onAdvance={onAdvance} onAbandon={onAbandon} />)}</div> : <p className="quest-empty">前往地图上带有“任务”标记的地点，寻找可接取的委托。</p>}</section>
+    {history.length > 0 && <section className="quest-group quest-history-group"><div className="quest-group-heading"><h3>已留在身后的故事</h3><small>最近记录</small></div><div className="quest-history-list">{history.map(({ progress, quest }) => <div className={`quest-history-row ${progress.status}`} key={`${quest.id}-${progress.finishedTurn}`}><span>{progress.status === "completed" ? <Check size={14} /> : <X size={14} />}</span><span>{quest.title}</span><small>{progress.status === "completed" ? "已完成" : progress.failureReason ?? "已结束"}</small></div>)}</div></section>}
+  </section>;
+}
+
+function questStageTargetsRole(stage: QuestStageDefinition, role: WorldLocation["role"]): boolean {
+  if (stage.locationRoles?.includes(role)) return true;
+  const objective = stage.objective;
+  return Boolean((objective?.type === "visit" || objective?.type === "resource") && objective.locationRoles?.includes(role));
+}
+
+function QuestLocationActions({ game, locationId, onAccept, onAdvance }: { game: GameState; locationId: string; onAccept: (questId: string) => void; onAdvance: (questId: string) => void }) {
+  const offers = getLocationQuestOffers(game, locationId);
+  const location = game.world.locations.find((candidate) => candidate.id === locationId);
+  const active = game.quests.filter((progress) => progress.status === "active").flatMap((progress) => {
+    const quest = getQuestDefinition(game, progress.questId);
+    const stage = quest?.stages[progress.stageIndex];
+    return quest && stage && (questStageTargetsRole(stage, location?.role ?? "sanctuary") || progress.stageIndex === 0 && offers.some((offer) => offer.quest.id === quest.id)) ? [{ progress, quest, stage }] : [];
+  });
+  if (!offers.length && !active.length) return null;
+  return <section className="quest-location-actions"><div className="quest-location-heading"><span className="eyebrow">此地因果</span><strong>{offers.length + active.length} 项任务</strong></div>{offers.map(({ quest }) => { const access = canAcceptQuest(game, quest.id); return <div className="quest-location-row" key={`offer-${quest.id}`}><span><b>{quest.title}</b><small>{quest.summary}</small></span><button className="secondary-command" type="button" disabled={!access.allowed} title={access.reason} onClick={() => onAccept(quest.id)}><ScrollText size={14} />接取</button></div>; })}{active.map(({ progress, quest, stage }) => { const access = canAdvanceQuest(game, quest.id); return <div className="quest-location-row active" key={`active-${quest.id}`}><span><b>{quest.title} · {stage.title}</b><small>{stage.objective?.description ?? "可在此推进任务阶段"} · {questDeadlineLabel(game, progress)}</small></span><button className="primary-command" type="button" disabled={!access.allowed} title={access.reason} onClick={() => onAdvance(quest.id)}><Route size={14} />推进</button></div>; })}</section>;
+}
+
+function WorldMap({ game, onTravel, onAction, onMarket, onBreakthrough, onAcceptQuest, onAdvanceQuest, showActions, onShowActionsChange }: { game: GameState; onTravel: (locationId: string) => void; onAction: (id: ActionId, durationDays?: number) => void; onMarket: () => void; onBreakthrough: () => void; onAcceptQuest: (questId: string) => void; onAdvanceQuest: (questId: string) => void; showActions: boolean; onShowActionsChange: (open: boolean) => void }) {
   const current = getCurrentLocation(game);
   const [selectedId, setSelectedId] = useState(current.id);
   const [pan, setPan] = useState({ x: 0, y: 0 });
@@ -426,6 +606,7 @@ function WorldMap({ game, onTravel, onAction, onMarket, onBreakthrough, showActi
   const layerWidthFactor = game.world.locations.length > 60 ? 48 : 36;
   const layerHeightFactor = game.world.locations.length > 60 ? 50 : 36;
   const mapLayerStyle = { width: `${Math.max(100, mapColumns * layerWidthFactor)}%`, height: `${Math.max(100, mapRows * layerHeightFactor)}%`, transform: `translate(${pan.x}px, ${pan.y}px) scale(${zoom})` };
+  const mapContentKey = game.world.locations.map((location) => `${location.id}:${location.position.x}:${location.position.y}:${location.connections.join(",")}`).join("|");
   return (
     <section className="world-map-section">
       <header className="map-header">
@@ -434,7 +615,7 @@ function WorldMap({ game, onTravel, onAction, onMarket, onBreakthrough, showActi
         <div className="current-place"><MapPin size={16} /><span>当前 · {game.world.locations.length} 处地点</span><strong>{current.name}</strong></div>
       </header>
       <div ref={mapCanvasRef} className={`world-map-canvas ${dragging ? "dragging" : ""}`} aria-label="世界地图" onPointerDown={beginPan} onPointerMove={movePan} onPointerUp={endPan} onPointerCancel={endPan}>
-        <div className="map-layer" style={mapLayerStyle}>
+        <div key={mapContentKey} className="map-layer" style={mapLayerStyle}>
         <svg className="route-layer" viewBox="0 0 100 100" preserveAspectRatio="none" aria-hidden="true">
           {routes.map(({ from, to }) => {
             const active = from.id === current.id || to.id === current.id;
@@ -444,6 +625,13 @@ function WorldMap({ game, onTravel, onAction, onMarket, onBreakthrough, showActi
         </svg>
         {game.world.locations.map((location) => {
           const Icon = locationIcons[location.icon];
+          const locationQuestOffers = getLocationQuestOffers(game, location.id);
+          const hasActiveQuestHere = game.quests.some((progress) => {
+            if (progress.status !== "active") return false;
+            const quest = getQuestDefinition(game, progress.questId);
+            const stage = quest?.stages[progress.stageIndex];
+            return Boolean(stage && questStageTargetsRole(stage, location.role));
+          });
           const isCurrent = location.id === current.id;
           const isSelected = location.id === selected.id;
           const isLocked = location.unlockStage > game.realmStage;
@@ -470,6 +658,7 @@ function WorldMap({ game, onTravel, onAction, onMarket, onBreakthrough, showActi
               <span className="map-node-icon">{isLocked ? <LockKeyhole size={18} /> : <Icon size={20} />}</span>
               <b>{isLocked ? "未知之地" : location.name}</b>
               <small>{isCurrent ? "身在此处" : isReachable ? "道路相连" : location.danger}</small>
+              {(locationQuestOffers.length > 0 || hasActiveQuestHere) && <span className={`map-node-quest ${hasActiveQuestHere ? "active" : ""}`} title={hasActiveQuestHere ? "有任务阶段可推进" : "有新的任务委托"}><ScrollText size={11} />{hasActiveQuestHere ? "进行中" : "任务"}</span>}
             </button>
           );
         })}
@@ -487,7 +676,8 @@ function WorldMap({ game, onTravel, onAction, onMarket, onBreakthrough, showActi
           {selected.id === current.id ? <button type="button" disabled><MapPin size={17} />身在此处</button> : <button type="button" disabled={!access.allowed} onClick={() => onTravel(selected.id)}><Route size={17} />前往此地<small>{access.allowed && travelPath ? `${travelPath.length - 1} 天 · ${travelCost} 灵力 · 自动走最短路线` : access.reason}</small></button>}
         </div>
       </div>
-      {selected.id === current.id ? (!game.pendingEventId && showActions && <ActionPanel game={game} onAction={onAction} onMarket={onMarket} onBreakthrough={onBreakthrough} onClose={() => onShowActionsChange(false)} />) : <div className="map-action-hint">抵达此地后，方可使用这里提供的行动。</div>}
+      <QuestLocationActions game={game} locationId={selected.id} onAccept={onAcceptQuest} onAdvance={onAdvanceQuest} />
+      {selected.id === current.id ? (!game.pendingEventId && !game.pendingQuestId && showActions && <ActionPanel game={game} onAction={onAction} onMarket={onMarket} onBreakthrough={onBreakthrough} onAcceptQuest={onAcceptQuest} onAdvanceQuest={onAdvanceQuest} onClose={() => onShowActionsChange(false)} />) : <div className="map-action-hint">抵达此地后，方可使用这里提供的行动。</div>}
     </section>
   );
 }
@@ -517,7 +707,36 @@ function ActionDurationDialog({ game, action, onConfirm, onClose }: { game: Game
   );
 }
 
-function ActionPanel({ game, onAction, onMarket, onBreakthrough, onClose, variant = "modal" }: { game: GameState; onAction: (id: ActionId, durationDays?: number) => void; onMarket?: () => void; onBreakthrough: () => void; onClose?: () => void; variant?: "modal" | "sidebar" }) {
+function QuestActionsAtLocation({ game, onAccept, onAdvance, onClose }: { game: GameState; onAccept?: (questId: string) => void; onAdvance?: (questId: string) => void; onClose?: () => void }) {
+  const location = getCurrentLocation(game);
+  const offers = getLocationQuestOffers(game);
+  const active = game.quests.filter((progress) => progress.status === "active").flatMap((progress) => {
+    const quest = getQuestDefinition(game, progress.questId);
+    const stage = quest?.stages[progress.stageIndex];
+    if (!quest || !stage) return [];
+    const objectiveRoles = stage.objective?.type === "visit" || stage.objective?.type === "resource" ? stage.objective.locationRoles : undefined;
+    const availableAnywhere = !stage.locationRoles?.length && !objectiveRoles?.length;
+    return questStageTargetsRole(stage, location.role) || availableAnywhere ? [{ progress, quest, stage }] : [];
+  });
+  if (!offers.length && !active.length) return null;
+  return <div className="quest-action-list">
+    {offers.map(({ quest }) => {
+      const access = canAcceptQuest(game, quest.id);
+      return <button key={`offer-${quest.id}`} className="action-button quest-action-button" type="button" disabled={!access.allowed || !onAccept} title={access.reason} onClick={() => { onAccept?.(quest.id); onClose?.(); }}>
+        <span className="action-icon"><ScrollText size={20} /></span><span><b>{quest.title}</b><small>{quest.summary} · 限时 {quest.timeLimitDays ?? "无"} 天</small></span><em>接取</em>
+      </button>;
+    })}
+    {active.map(({ progress, quest, stage }) => {
+      const access = canAdvanceQuest(game, quest.id);
+      const objective = stage.objective?.description ?? (stage.kind === "encounter" ? "抵达此处后推进阶段" : "检查任务进度");
+      return <button key={`active-${quest.id}`} className="action-button quest-action-button active" type="button" disabled={!access.allowed || !onAdvance} title={access.reason} onClick={() => { onAdvance?.(quest.id); onClose?.(); }}>
+        <span className="action-icon"><Route size={20} /></span><span><b>{quest.title} · {stage.title}</b><small>{objective} · {questDeadlineLabel(game, progress)}</small></span><em>推进</em>
+      </button>;
+    })}
+  </div>;
+}
+
+function ActionPanel({ game, onAction, onMarket, onBreakthrough, onAcceptQuest, onAdvanceQuest, onClose, variant = "modal" }: { game: GameState; onAction: (id: ActionId, durationDays?: number) => void; onMarket?: () => void; onBreakthrough: () => void; onAcceptQuest?: (questId: string) => void; onAdvanceQuest?: (questId: string) => void; onClose?: () => void; variant?: "modal" | "sidebar" }) {
   const breakthroughReady = canBreakthrough(game);
   const location = getCurrentLocation(game);
   const innateActions = ACTIONS.filter((action) => action.category === "innate");
@@ -535,10 +754,11 @@ function ActionPanel({ game, onAction, onMarket, onBreakthrough, onClose, varian
     const durationLabel = action.durationRange ? `${action.durationRange.min}-${action.durationRange.max} 天可调` : `耗时 ${action.durationDays} 天`;
     return <button key={action.id} className="action-button" type="button" disabled={!access.allowed} onClick={() => { if (action.id === "market") { onMarket?.(); onClose?.(); return; } if (action.durationRange) setDurationAction(action); else { onAction(action.id, action.durationDays); onClose?.(); } }} title={access.reason}><span className="action-icon"><Icon size={20} /></span><span><b>{action.name}</b><small>{access.allowed ? `${action.description} · ${durationLabel}` : access.reason}</small></span><em>{action.risk}</em></button>;
   };
+  const locationQuestActions = <QuestActionsAtLocation game={game} onAccept={onAcceptQuest} onAdvance={onAdvanceQuest} onClose={onClose} />;
   const actionContent = <>
     {breakthroughReady && <button className={`breakthrough-button ${variant === "modal" ? "action-menu-breakthrough" : "action-sidebar-breakthrough"}`} type="button" onClick={() => { onClose?.(); onBreakthrough(); }}><Sparkles size={17} />尝试破境</button>}
     <div className="action-group"><span className="action-group-label">自身固有行动</span><div className="action-grid">{innateActions.map(renderAction)}</div></div>
-    {locationActions.length > 0 && <div className="action-group"><span className="action-group-label">地点提供行动</span><div className="action-grid">{locationActions.map(renderAction)}</div></div>}
+    {(locationActions.length > 0 || locationQuestActions) && <div className="action-group"><span className="action-group-label">地点提供行动</span><div className="action-grid">{locationActions.map(renderAction)}{locationQuestActions}</div></div>}
   </>;
   const panel = variant === "sidebar"
     ? <section className="side-section actions-sidebar"><header className="actions-sidebar-header"><div><span className="eyebrow">第 {game.turn} 天 · 今日行动</span><h3><ListChecks size={17} />{location.name}</h3></div></header><p className="action-menu-summary">每次行动会消耗对应天数。固有行动随身可用，地点行动取决于当前落脚处。</p>{actionContent}</section>
@@ -564,8 +784,8 @@ function NpcSidebar({ game, onInteract, onToggleAttention }: { game: GameState; 
   return <section className="side-section npc-sidebar" aria-labelledby="sidebar-npcs-title"><div className="npc-section-heading"><div><span className="eyebrow">来往人物</span><h3 id="sidebar-npcs-title">此地 NPC</h3></div><span className="npc-count"><Users size={16} />{npcs.length} 人</span></div>{npcs.length > 0 ? <div className="npc-list">{npcs.map((npc) => <NpcCard key={npc.id} npc={npc} onSelect={() => setSelectedNpcId(npc.id)} />)}</div> : <p className="npc-empty">这里暂时没有与你擦肩而过的人。</p>}{selectedNpc && <NpcDialog game={game} npc={selectedNpc} onClose={() => setSelectedNpcId(undefined)} onInteract={onInteract} onToggleAttention={onToggleAttention} />}</section>;
 }
 
-function ActionSidebar({ game, onAction, onMarket, onBreakthrough, onNpcInteraction, onToggleAttention }: { game: GameState; onAction: (id: ActionId, durationDays?: number) => void; onMarket?: () => void; onBreakthrough: () => void; onNpcInteraction: (npcId: string, interactionId: NpcInteractionId) => void; onToggleAttention: (npcId: string) => void }) {
-  return <><ActionPanel game={game} onAction={onAction} onMarket={onMarket} onBreakthrough={onBreakthrough} variant="sidebar" /><NpcSidebar game={game} onInteract={onNpcInteraction} onToggleAttention={onToggleAttention} /></>;
+function ActionSidebar({ game, onAction, onMarket, onBreakthrough, onAcceptQuest, onAdvanceQuest, onNpcInteraction, onToggleAttention }: { game: GameState; onAction: (id: ActionId, durationDays?: number) => void; onMarket?: () => void; onBreakthrough: () => void; onAcceptQuest?: (questId: string) => void; onAdvanceQuest?: (questId: string) => void; onNpcInteraction: (npcId: string, interactionId: NpcInteractionId) => void; onToggleAttention: (npcId: string) => void }) {
+  return <><ActionPanel game={game} onAction={onAction} onMarket={onMarket} onBreakthrough={onBreakthrough} onAcceptQuest={onAcceptQuest} onAdvanceQuest={onAdvanceQuest} variant="sidebar" /><NpcSidebar game={game} onInteract={onNpcInteraction} onToggleAttention={onToggleAttention} /></>;
 }
 
 function NpcDialog({ game, npc, onClose, onInteract, onToggleAttention }: { game: GameState; npc: Npc; onClose: () => void; onInteract: (npcId: string, interactionId: NpcInteractionId) => void; onToggleAttention: (npcId: string) => void }) {
@@ -595,7 +815,7 @@ function NpcDialog({ game, npc, onClose, onInteract, onToggleAttention }: { game
 }
 
 function ItemGiftDialog({ game, itemId, onClose, onConfirm }: { game: GameState; itemId: string; onClose: () => void; onConfirm: (npcId: string) => void }) {
-  const item = itemMap.get(itemId);
+  const item = getItem(game, itemId);
   const npcs = getLocationNpcs(game).filter((npc) => canGiftItem(game, npc.id, itemId).allowed);
   if (!item) return null;
   return <div className="modal-backdrop item-gift-backdrop" role="presentation" onMouseDown={(event) => { if (event.target === event.currentTarget) onClose(); }}>
@@ -643,15 +863,54 @@ function PendingEvent({ game, onChoose, busy }: { game: GameState; onChoose: (ch
   );
 }
 
+function PendingQuest({ game, onChoose, busy }: { game: GameState; onChoose: (choice: string) => void; busy?: boolean }) {
+  const current = getCurrentQuestStage(game);
+  if (!current) return null;
+  const { quest, progress, stage } = current;
+  return <div className="modal-backdrop quest-modal-backdrop" role="presentation">
+    <section className="dialog event-dialog event-section quest-dialog" role="dialog" aria-modal="true" aria-labelledby="pending-quest-title" aria-describedby="pending-quest-body" aria-live="polite">
+      <div className="day-marker">第 {game.turn} 天 · 阶段 {progress.stageIndex + 1} / {quest.stages.length}</div>
+      <div className="event-ornament"><span /><ScrollText size={17} /><span /></div>
+      <span className="eyebrow">主动任务 · {quest.title}</span>
+      <h2 id="pending-quest-title">{stage.title}</h2>
+      <span className="event-duration">本阶段预计耗时 {stage.durationDays ?? 1} 天 · {questDeadlineLabel(game, progress)}</span>
+      <p id="pending-quest-body">{stage.body}</p>
+      {stage.objective && <p className="quest-encounter-objective"><Target size={15} />{stage.objective.description}</p>}
+      {busy && <p className="ai-working" role="status"><Bot size={16} />AI 正在裁定此任务……</p>}
+      <div className="choice-list">{stage.choices?.length ? stage.choices.map((choice: QuestChoice) => {
+        const enabled = canChoose(game, choice);
+        return <button key={choice.id} type="button" disabled={!enabled || Boolean(busy)} onClick={() => onChoose(choice.id)}><span><b>{choice.label}</b><small>{enabled ? choice.hint : "条件不足"}</small></span><ChevronRight size={18} /></button>;
+      }) : <button type="button" disabled={Boolean(busy)} onClick={() => onChoose("__continue__")}><span><b>继续推进</b><small>这段因果没有需要抉择的分岔</small></span><ChevronRight size={18} /></button>}</div>
+    </section>
+  </div>;
+}
+
 function EventResultDialog({ result, onClose }: { result: EventResult; onClose: () => void }) {
+  const generatedGroups = [
+    { key: "locations", label: "地点", icon: MapPin, items: result.generatedContent?.locations ?? [] },
+    { key: "npcs", label: "人物", icon: Users, items: result.generatedContent?.npcs ?? [] },
+    { key: "quests", label: "任务", icon: ListChecks, items: result.generatedContent?.quests ?? [] },
+    { key: "events", label: "事件", icon: ScrollText, items: result.generatedContent?.events ?? [] },
+    { key: "items", label: "物品", icon: PackageOpen, items: result.generatedContent?.items ?? [] },
+  ];
+  const visibleGeneratedGroups = generatedGroups.filter((group) => group.items.length > 0);
   return (
     <div className="modal-backdrop event-result-backdrop" role="presentation">
       <section className={`dialog event-section event-result-dialog tone-${result.tone}`} role="dialog" aria-modal="true" aria-labelledby="event-result-title" aria-describedby="event-result-text">
         <div className="event-ornament"><span /><Check size={17} /><span /></div>
-        <span className="eyebrow">{result.kind === "action" ? "行动结果" : "事件结果"}</span>
+        <span className="eyebrow">{result.kind === "action" ? "行动结果" : result.kind === "quest" ? "任务结果" : "事件结果"}</span>
         <h2 id="event-result-title">{result.title}</h2>
         <span className="event-duration">{result.durationDays ? `本次耗时 ${result.durationDays} 天` : "即时操作"}</span>
         <p id="event-result-text">{result.text}</p>
+        {visibleGeneratedGroups.length > 0 && <div className="generated-content-summary" aria-label="本次新增因果">
+          <span className="event-result-label">本次新增因果</span>
+          <div className="generated-content-groups">
+            {visibleGeneratedGroups.map(({ key, label, icon: Icon, items }) => <section className="generated-content-group" key={key}>
+              <div className="generated-content-group-label"><Icon size={15} /><span>{label}</span><b>{items.length}</b></div>
+              <ul>{items.map((item, index) => <li key={`${item}-${index}`}>{item}</li>)}</ul>
+            </section>)}
+          </div>
+        </div>}
         <div className="event-result-changes" aria-label="属性变化">
           <span className="event-result-label">本次变化</span>
           {result.changes.length > 0 ? result.changes.map((change) => <div className={`event-result-change ${change.amount > 0 ? "event-change-positive" : "event-change-negative"}`} key={`${change.label}-${change.amount}`}><span>{change.label}</span><strong>{change.amount > 0 ? `+${change.amount}` : change.amount}</strong></div>) : <p className="event-result-empty">没有可见的属性变化。</p>}
@@ -688,7 +947,7 @@ function AiWorkingDialog() {
 }
 
 function ChronicleDetailDialog({ entry, onClose }: { entry: ChronicleEntry; onClose: () => void }) {
-  const kindLabel = entry.kind === "event" ? "事件记录" : entry.kind === "action" ? "行动记录" : "人生记录";
+  const kindLabel = entry.kind === "event" ? "事件记录" : entry.kind === "quest" ? "任务记录" : entry.kind === "action" ? "行动记录" : "人生记录";
   return (
     <div className="modal-backdrop chronicle-detail-backdrop" role="presentation" onMouseDown={(event) => { if (event.target === event.currentTarget) onClose(); }}>
       <section className="dialog chronicle-detail-dialog" role="dialog" aria-modal="true" aria-labelledby="chronicle-detail-title" aria-describedby="chronicle-detail-text">
@@ -716,7 +975,7 @@ function Chronicle({ game }: { game: GameState }) {
   return (
     <section className="chronicle-section">
       <span className="chronicle-legacy-label" aria-hidden="true">行旅录</span>
-      <div className="chronicle-list">{entries.map((entry, index) => { const kindLabel = entry.kind === "event" ? "事件" : entry.kind === "action" ? "行动" : "人生记录"; return <button className={`chronicle-entry tone-${entry.tone}`} type="button" key={entry.id} onClick={() => setSelectedEntry(entry)} aria-label={`${kindLabel}：第 ${entry.turn} 天，${entry.title}，查看详情`}><span className="chronicle-dot" /><span className="chronicle-entry-copy"><span>第 {entry.turn} 天 · {entry.title}</span><span className="chronicle-entry-text">{entry.text}</span></span>{index === 0 && <em>近日 · 查看详情</em>}</button>; })}</div>
+       <div className="chronicle-list">{entries.map((entry, index) => { const kindLabel = entry.kind === "event" ? "事件" : entry.kind === "quest" ? "任务" : entry.kind === "action" ? "行动" : "人生记录"; return <button className={`chronicle-entry tone-${entry.tone}`} type="button" key={`${entry.id}-${index}`} onClick={() => setSelectedEntry(entry)} aria-label={`${kindLabel}：第 ${entry.turn} 天，${entry.title}，查看详情`}><span className="chronicle-dot" /><span className="chronicle-entry-copy"><span>第 {entry.turn} 天 · {entry.title}</span><span className="chronicle-entry-text">{entry.text}</span></span>{index === 0 && <em>近日 · 查看详情</em>}</button>; })}</div>
       {selectedEntry && <ChronicleDetailDialog entry={selectedEntry} onClose={() => setSelectedEntry(undefined)} />}
     </section>
   );
@@ -755,7 +1014,7 @@ function EndScreen({ game, meta, onReincarnate, onHome }: { game: GameState; met
   );
 }
 
-function SaveDialog({ game, meta, aiSettings, onAiSettingsChange, onClose, onImport, onNew }: { game: GameState | null; meta: MetaProgress; aiSettings: AiSettings; onAiSettingsChange: (settings: AiSettings) => void; onClose: () => void; onImport: (game: GameState | null, meta: MetaProgress) => void; onNew: () => void }) {
+function SaveDialog({ game, meta, theme, onThemeChange, aiSettings, onAiSettingsChange, onClose, onImport, onNew }: { game: GameState | null; meta: MetaProgress; theme: ThemeMode; onThemeChange: (theme: ThemeMode) => void; aiSettings: AiSettings; onAiSettingsChange: (settings: AiSettings) => void; onClose: () => void; onImport: (game: GameState | null, meta: MetaProgress) => void; onNew: () => void }) {
   const fileRef = useRef<HTMLInputElement>(null);
   const [message, setMessage] = useState("");
   const [draftAi, setDraftAi] = useState<AiSettings>(aiSettings);
@@ -804,13 +1063,21 @@ function SaveDialog({ game, meta, aiSettings, onAiSettingsChange, onClose, onImp
           <button type="button" onClick={() => fileRef.current?.click()}><Import size={20} /><span><b>导入存档</b><small>载入另一份 JSON 卷宗</small></span></button>
           <input ref={fileRef} hidden type="file" accept="application/json,.json" onChange={(event) => void read(event.target.files?.[0])} />
         </div>
+        <section className="theme-settings-section" aria-labelledby="theme-settings-title">
+          <div className="theme-settings-heading"><div><span className="eyebrow">界面外观</span><h3 id="theme-settings-title">主题</h3></div><span className="theme-settings-current">{theme === "dark" ? "夜间" : "日间"}</span></div>
+          <div className="theme-options" role="group" aria-label="选择主题">
+            <button type="button" className={theme === "light" ? "selected" : ""} aria-pressed={theme === "light"} onClick={() => onThemeChange("light")}><Sun size={18} /><span><b>浅色主题</b><small>清晰明亮，适合白天</small></span></button>
+            <button type="button" className={theme === "dark" ? "selected" : ""} aria-pressed={theme === "dark"} onClick={() => onThemeChange("dark")}><Moon size={18} /><span><b>深色主题</b><small>沉浸安静，适合夜间</small></span></button>
+          </div>
+        </section>
         <section className="ai-settings-section" aria-labelledby="ai-settings-title">
           <header className="ai-settings-heading"><div><span className="eyebrow">可选叙事引擎</span><h3 id="ai-settings-title"><Bot size={17} />AI 模式</h3></div><label className="ai-toggle"><input type="checkbox" checked={draftAi.enabled} onChange={(event) => updateAi("enabled", event.target.checked)} /><span>{draftAi.enabled ? "已开启" : "已关闭"}</span></label></header>
-          <p className="settings-note">开启后，行动与事件会把当前角色、属性、地点和近期历程发送给配置的模型，由模型生成结果文案与属性变化。请求从浏览器直接发出，接口需允许跨域。</p>
+          <p className="settings-note">开启后，行动与事件会把当前角色、属性、地点和近期历程发送给配置的模型，由模型生成结果文案与属性变化。世界生成模式还可以让 AI 创作新的剧情、地点、任务链、事件、物品和 NPC。请求从浏览器直接发出，接口需允许跨域。</p>
           <label className="setting-field"><span>API 格式</span><select value={draftAi.format} onChange={(event) => { const format = event.target.value as AiSettings["format"]; updateAi("format", format); setModels([]); }}><option value="openai">OpenAI 兼容格式</option><option value="claude">Claude Messages 格式</option></select></label>
           <label className="setting-field"><span>API 地址</span><input type="url" value={draftAi.endpoint} placeholder={draftAi.format === "openai" ? "https://api.openai.com/v1/chat/completions" : "https://api.anthropic.com/v1/messages"} onChange={(event) => updateAi("endpoint", event.target.value)} /></label>
           <label className="setting-field"><span>API Key</span><input type="password" autoComplete="off" value={draftAi.apiKey} placeholder="仅保存在本机浏览器" onChange={(event) => updateAi("apiKey", event.target.value)} /></label>
           <div className="setting-field model-field"><span>使用模型</span><div className="model-picker"><input list="ai-model-options" value={draftAi.model} placeholder={draftAi.format === "openai" ? "例如 gpt-4o-mini" : "例如 claude-3-5-sonnet-latest"} onChange={(event) => updateAi("model", event.target.value)} /><button className="secondary-command" type="button" disabled={loadingModels || !draftAi.apiKey.trim()} onClick={() => void loadModels()}><RefreshCw size={15} className={loadingModels ? "spin" : ""} />获取模型</button><datalist id="ai-model-options">{models.map((model) => <option key={model} value={model} />)}</datalist></div></div>
+          <label className="setting-field"><span>世界内容生成</span><select value={draftAi.questGeneration} onChange={(event) => updateAi("questGeneration", event.target.value as AiSettings["questGeneration"])}><option value="off">关闭自动生成</option><option value="manual">手动开拓世界</option><option value="continuous">随游戏推进持续生成</option></select></label>
           {modelMessage && <p className="settings-message" role="status">{modelMessage}</p>}
           <button className="primary-command ai-save-button" type="button" onClick={saveAi}><Bot size={17} />保存 AI 设置</button>
         </section>
@@ -821,8 +1088,8 @@ function SaveDialog({ game, meta, aiSettings, onAiSettingsChange, onClose, onImp
   );
 }
 
-function GameScreen({ game, meta, aiSettings, onAiSettingsChange, onGame, onMeta, onHome, onReincarnate, onManage }: { game: GameState; meta: MetaProgress; aiSettings: AiSettings; onAiSettingsChange: (settings: AiSettings) => void; onGame: (game: GameState) => void; onMeta: (meta: MetaProgress) => void; onHome: () => void; onReincarnate: () => void; onManage: () => void }) {
-  const [tab, setTab] = useState<MobileTab>(() => game.pendingEventId ? "map" : "journey");
+function GameScreen({ game, meta, theme, onThemeChange, aiSettings, onAiSettingsChange, onGame, onMeta, onHome, onReincarnate, onManage }: { game: GameState; meta: MetaProgress; theme: ThemeMode; onThemeChange: (theme: ThemeMode) => void; aiSettings: AiSettings; onAiSettingsChange: (settings: AiSettings) => void; onGame: (game: GameState) => void; onMeta: (meta: MetaProgress) => void; onHome: () => void; onReincarnate: () => void; onManage: () => void }) {
+  const [tab, setTab] = useState<MobileTab>(() => game.pendingEventId || game.pendingQuestId ? "map" : "journey");
   const [showBreakthrough, setShowBreakthrough] = useState(false);
   const [showDetails, setShowDetails] = useState(false);
   const [showActions, setShowActions] = useState(false);
@@ -844,6 +1111,75 @@ function GameScreen({ game, meta, aiSettings, onAiSettingsChange, onGame, onMeta
       onMeta(claimedResult.meta);
     }
   }, [claimedResult, game.legacyClaimed, onGame, onMeta]);
+  const shouldGenerateContent = (baseGame: GameState, trigger: AiQuestGenerationTrigger): boolean => {
+    if (!aiSettings.enabled || aiSettings.questGeneration !== "continuous" || baseGame.status !== "playing") return false;
+    const lastTurn = baseGame.aiContentLastTurn ?? -Infinity;
+    const elapsed = baseGame.turn - lastTurn;
+    const threshold = trigger.kind === "event" || trigger.kind === "quest" ? 2 : 5;
+    return lastTurn === -Infinity || elapsed >= threshold;
+  };
+  const generateContent = async (baseGame: GameState, trigger: AiQuestGenerationTrigger, announce: boolean): Promise<GameState> => {
+    if (aiBusyRef.current || !aiSettings.enabled || aiSettings.questGeneration === "off") return baseGame;
+    aiBusyRef.current = true;
+    setAiBusy(true);
+    setAiNotice("");
+    try {
+      if (!isAiConfigured(aiSettings)) throw new Error("AI 配置不完整");
+      const bundle = await requestAiContent(aiSettings, baseGame, trigger);
+      return addGeneratedContent(baseGame, bundle, announce);
+    } catch (error) {
+      console.error("[AI content generation]", error);
+      setAiNotice(`AI 世界内容生成失败，已保留本地状态${error instanceof Error ? `：${error.message}` : ""}`);
+      return baseGame;
+    } finally {
+      aiBusyRef.current = false;
+      setAiBusy(false);
+    }
+  };
+  const generateContinuousContent = async (baseGame: GameState, trigger: AiQuestGenerationTrigger): Promise<GameState> => {
+    if (!shouldGenerateContent(baseGame, trigger)) return baseGame;
+    return generateContent(baseGame, trigger, false);
+  };
+  const generateEventContent = async (baseGame: GameState, trigger: AiQuestGenerationTrigger): Promise<GameState> => {
+    if (!aiSettings.enabled || aiSettings.questGeneration !== "continuous" || baseGame.status !== "playing") return baseGame;
+    const rolled = rollAiContentChance(baseGame);
+    if (!rolled.shouldGenerate) return rolled.game;
+    return generateContent(rolled.game, trigger, false);
+  };
+  const contentTrigger = (kind: AiQuestGenerationTrigger["kind"], title: string, text: string, baseGame: GameState): AiQuestGenerationTrigger => ({
+    kind,
+    title,
+    text,
+    locationName: getCurrentLocation(baseGame).name,
+  });
+  const acceptQuestAction = (questId: string) => {
+    if (aiBusyRef.current) return;
+    const next = acceptQuest(game, questId);
+    if (next === game) return;
+    onGame(next);
+    const quest = getQuestDefinition(next, questId);
+    void generateContinuousContent(next, contentTrigger("quest", quest?.title ?? "接受任务", quest?.summary ?? "一条新的任务线索进入了你的生命。", next)).then((generatedNext) => {
+      if (generatedNext !== next) onGame(generatedNext);
+    });
+  };
+  const advanceQuestAction = (questId: string) => {
+    if (aiBusyRef.current) return;
+    const next = advanceQuest(game, questId);
+    if (next === game) return;
+    onGame(next);
+    if (next.pendingQuestId) setTab(tab === "quests" ? "quests" : "map");
+    const quest = getQuestDefinition(next, questId);
+    void generateContinuousContent(next, contentTrigger("quest", quest?.title ?? "推进任务", quest?.summary ?? "任务的下一段因果正在浮现。", next)).then((generatedNext) => {
+      if (generatedNext !== next) onGame(generatedNext);
+    });
+  };
+  const abandonQuestAction = (questId: string) => {
+    if (aiBusyRef.current) return;
+    const quest = getQuestStage(game, questId)?.quest;
+    if (!quest || !window.confirm(`确定放弃“${quest.title}”吗？已消耗的时间不会返还。`)) return;
+    const next = abandonQuest(game, questId);
+    if (next !== game) onGame(next);
+  };
   const action = async (id: ActionId, durationDays?: number) => {
     if (aiBusyRef.current) return;
     const definition = ACTIONS.find((item) => item.id === id);
@@ -868,11 +1204,14 @@ function GameScreen({ game, meta, aiSettings, onAiSettingsChange, onGame, onMeta
     } else {
       next = performAction(game, id, requestedDays);
     }
+    if (next === game) return;
     onGame(next);
     setShowActions(false);
     const nextTab = next.pendingEventId ? "map" : tab === "map" ? "map" : tab === "actions" ? "actions" : "journey";
     setTab(nextTab);
     window.scrollTo({ top: 0, behavior: "smooth" });
+    const generatedNext = await generateContinuousContent(next, contentTrigger("action", definition?.name ?? id, "这次行动为之后的因果留下了新的空白。", next));
+    if (generatedNext !== next) onGame(generatedNext);
   };
   const openMarket = () => {
     if (aiBusyRef.current) return;
@@ -903,15 +1242,19 @@ function GameScreen({ game, meta, aiSettings, onAiSettingsChange, onGame, onMeta
     } else {
       next = travelTo(game, locationId);
     }
+    if (next === game) return;
     onGame(next);
     setShowActions(false);
     setTab("map");
     window.scrollTo({ top: 0, behavior: "smooth" });
+    const generatedNext = await generateContinuousContent(next, contentTrigger("travel", target?.name ?? "前往新地点", "你沿着地图上的路径继续前行，远方似乎还有新的故事等待展开。", next));
+    if (generatedNext !== next) onGame(generatedNext);
   };
   const choose = async (id: string) => {
     if (aiBusyRef.current) return;
     const event = getCurrentEvent(game);
     if (!event) return;
+    let next: GameState;
     if (aiSettings.enabled) {
       aiBusyRef.current = true;
       setAiBusy(true);
@@ -920,17 +1263,52 @@ function GameScreen({ game, meta, aiSettings, onAiSettingsChange, onGame, onMeta
         if (!isAiConfigured(aiSettings)) throw new Error("AI 配置不完整");
         const choice = event.choices.find((item) => item.id === id);
         const generated = await requestAiEvent(aiSettings, game, event, choice);
-        onGame(resolveEventWithAi(game, id, generated));
+        next = resolveEventWithAi(game, id, generated);
       } catch (error) {
-        onGame(resolveEvent(game, id));
+        next = resolveEvent(game, id);
         setAiNotice(`AI 未能完成事件裁定，已使用本地规则${error instanceof Error ? `：${error.message}` : ""}`);
       } finally {
         aiBusyRef.current = false;
         setAiBusy(false);
       }
-      return;
+    } else {
+      next = resolveEvent(game, id);
     }
-    onGame(resolveEvent(game, id));
+    if (next === game) return;
+    onGame(next);
+    const generatedNext = await generateEventContent(next, contentTrigger("event", event.title, event.body, next));
+    if (generatedNext !== next) onGame(generatedNext);
+  };
+  const chooseQuest = async (id: string) => {
+    if (aiBusyRef.current) return;
+    const currentQuest = getCurrentQuestStage(game);
+    if (!currentQuest) return;
+    const choice = currentQuest.stage.choices?.find((candidate) => candidate.id === id);
+    const continueWithoutChoice = id === "__continue__" && !currentQuest.stage.choices?.length;
+    if (!choice && !continueWithoutChoice) return;
+    let next: GameState;
+    if (aiSettings.enabled) {
+      aiBusyRef.current = true;
+      setAiBusy(true);
+      setAiNotice("");
+      try {
+        if (!isAiConfigured(aiSettings)) throw new Error("AI 配置不完整");
+        const generated = await requestAiQuest(aiSettings, game, currentQuest.quest, currentQuest.stage, choice);
+        next = resolveQuestStageWithAi(game, id, generated);
+      } catch (error) {
+        next = resolveQuestStage(game, id);
+        setAiNotice(`AI 未能完成任务裁定，已使用本地规则${error instanceof Error ? `：${error.message}` : ""}`);
+      } finally {
+        aiBusyRef.current = false;
+        setAiBusy(false);
+      }
+    } else {
+      next = resolveQuestStage(game, id);
+    }
+    if (next === game) return;
+    onGame(next);
+    const generatedNext = await generateContinuousContent(next, contentTrigger("quest", currentQuest.quest.title, currentQuest.stage.body, next));
+    if (generatedNext !== next) onGame(generatedNext);
   };
   const npcInteraction = async (npcId: string, interactionId: NpcInteractionId) => {
     if (aiBusyRef.current) return;
@@ -955,9 +1333,12 @@ function GameScreen({ game, meta, aiSettings, onAiSettingsChange, onGame, onMeta
     } else {
       next = interactWithNpc(game, npcId, interactionId);
     }
+    if (next === game) return;
     onGame(next);
     // Keep the map visible when the interaction was started from the map sidebar.
     setTab(tab === "map" || tab === "npcs" ? tab : "actions");
+    const generatedNext = await generateContinuousContent(next, contentTrigger("npc", `${npc?.name ?? "NPC"} ${interaction?.name ?? "互动"}`, "一段新的交往正在改变彼此的命运。", next));
+    if (generatedNext !== next) onGame(generatedNext);
   };
   const toggleAttention = (npcId: string) => onGame(toggleNpcAttention(game, npcId));
   const itemUse = (itemId: string) => {
@@ -996,27 +1377,29 @@ function GameScreen({ game, meta, aiSettings, onAiSettingsChange, onGame, onMeta
   }
   return (
     <main className="game-shell">
-      <header className="game-header"><button className="brand-button" type="button" onClick={onHome}><Brand /></button><div className="turn-marker"><span>第 {game.turn} 天</span><i /><span>{REALMS[game.realmStage - 1]}</span><i /><span>{getCurrentLocation(game).name}</span></div><div className="header-tools"><label className={`header-ai-toggle ${aiSettings.enabled ? "active" : ""}`} title={aiSettings.enabled ? "关闭 AI 模式" : "开启 AI 模式"}><Bot size={16} /><span>AI</span><input type="checkbox" checked={aiSettings.enabled} onChange={(event) => onAiSettingsChange({ ...aiSettings, enabled: event.target.checked })} /><span className="header-ai-switch" aria-hidden="true"><span /></span></label><IconButton label="设置" icon={Settings} onClick={onManage} /><IconButton label="本次模拟详情" icon={Info} onClick={() => setShowDetails(true)} /><IconButton label="返回山门" icon={Menu} onClick={onHome} /></div></header>
+      <header className="game-header"><button className="brand-button" type="button" onClick={onHome}><Brand /></button><div className="turn-marker"><span>第 {game.turn} 天</span><i /><span>{REALMS[game.realmStage - 1]}</span><i /><span>{getCurrentLocation(game).name}</span></div><div className="header-tools"><label className={`header-ai-toggle ${aiSettings.enabled ? "active" : ""}`} title={aiSettings.enabled ? "关闭 AI 模式" : "开启 AI 模式"}><Bot size={16} /><span>AI</span><input type="checkbox" checked={aiSettings.enabled} onChange={(event) => onAiSettingsChange({ ...aiSettings, enabled: event.target.checked })} /><span className="header-ai-switch" aria-hidden="true"><span /></span></label><IconButton label={theme === "dark" ? "切换浅色主题" : "切换深色主题"} icon={theme === "dark" ? Sun : Moon} onClick={() => onThemeChange(theme === "dark" ? "light" : "dark")} /><IconButton label="设置" icon={Settings} onClick={onManage} /><IconButton label="本次模拟详情" icon={Info} onClick={() => setShowDetails(true)} /><IconButton label="返回山门" icon={Menu} onClick={onHome} /></div></header>
       <div className="desktop-layout">
         <aside className="left-sidebar"><StatPanel game={game} /></aside>
         <div className="center-column">
-          <nav className="view-tabs" aria-label="历程视图"><button type="button" className={tab === "journey" ? "active" : ""} onClick={() => setTab("journey")}><ScrollText size={16} />历程</button><button type="button" className={tab === "map" ? "active" : ""} onClick={() => setTab("map")}><MapIcon size={16} />异界舆图</button><button type="button" className={tab === "npcs" ? "active" : ""} onClick={() => setTab("npcs")}><Users size={16} />人物志</button><button type="button" className={tab === "inventory" ? "active" : ""} onClick={() => setTab("inventory")}><Backpack size={16} />物品栏</button></nav>
+          <nav className="view-tabs" aria-label="历程视图"><button type="button" className={tab === "journey" ? "active" : ""} onClick={() => setTab("journey")}><ScrollText size={16} />历程</button><button type="button" className={tab === "map" ? "active" : ""} onClick={() => setTab("map")}><MapIcon size={16} />异界舆图</button><button type="button" className={tab === "npcs" ? "active" : ""} onClick={() => setTab("npcs")}><Users size={16} />人物志</button><button type="button" className={tab === "quests" ? "active" : ""} onClick={() => setTab("quests")}><ListChecks size={16} />任务</button><button type="button" className={tab === "inventory" ? "active" : ""} onClick={() => setTab("inventory")}><Backpack size={16} />物品栏</button></nav>
           <div className={`center-panel ${tab === "journey" ? "active" : ""}`}><div className="mobile-status-strip"><span>第 {game.turn} 天</span><span><Heart size={14} />{Math.round(game.resources.stamina)}</span><span><Swords size={14} />{Math.round(game.resources.battlePower)}</span><span><Sparkles size={14} />{Math.round(game.resources.cultivation)}/{game.resources.cultivationRequired}</span></div><Chronicle game={game} /></div>
-          <div className={`center-panel ${tab === "map" ? "active" : ""}`}><WorldMap game={game} onTravel={travel} onAction={action} onMarket={openMarket} onBreakthrough={() => setShowBreakthrough(true)} showActions={showActions} onShowActionsChange={setShowActions} /></div>
+          <div className={`center-panel ${tab === "map" ? "active" : ""}`}><WorldMap game={game} onTravel={travel} onAction={action} onMarket={openMarket} onBreakthrough={() => setShowBreakthrough(true)} onAcceptQuest={acceptQuestAction} onAdvanceQuest={advanceQuestAction} showActions={showActions} onShowActionsChange={setShowActions} /></div>
           <div className={`center-panel ${tab === "npcs" ? "active" : ""}`}><NpcDirectory game={game} onInteract={npcInteraction} onToggleAttention={toggleAttention} /></div>
+          <div className={`center-panel ${tab === "quests" ? "active" : ""}`}><QuestPanel game={game} onAccept={acceptQuestAction} onAdvance={advanceQuestAction} onAbandon={abandonQuestAction} aiGenerationEnabled={aiSettings.enabled && aiSettings.questGeneration !== "off"} aiGenerating={aiBusy} onGenerateContent={() => { void generateContent(game, contentTrigger("manual", "主动开拓世界", "请根据当前人生继续创造新的因果。", game), true).then((next) => { if (next !== game) onGame(next); }); }} /></div>
           <div className={`center-panel ${tab === "inventory" ? "active" : ""}`}><InventoryPanel game={game} onUseItem={itemUse} onGiftItem={setGiftItemId} /></div>
         </div>
-        <aside className="right-sidebar">{!showActions && <ActionSidebar game={game} onAction={action} onMarket={openMarket} onBreakthrough={() => setShowBreakthrough(true)} onNpcInteraction={npcInteraction} onToggleAttention={toggleAttention} />}</aside>
+        <aside className="right-sidebar">{!showActions && <ActionSidebar game={game} onAction={action} onMarket={openMarket} onBreakthrough={() => setShowBreakthrough(true)} onAcceptQuest={acceptQuestAction} onAdvanceQuest={advanceQuestAction} onNpcInteraction={npcInteraction} onToggleAttention={toggleAttention} />}</aside>
         <div className={`mobile-only-panel ${tab === "inventory" ? "active" : ""}`}><InventoryPanel game={game} onUseItem={itemUse} onGiftItem={setGiftItemId} /></div>
         <div className={`mobile-only-panel ${tab === "character" ? "active" : ""}`}><StatPanel game={game} /></div>
-        {isNarrow && !showActions && <div className={`mobile-only-panel ${tab === "actions" ? "active" : ""}`}><ActionSidebar game={game} onAction={action} onMarket={openMarket} onBreakthrough={() => setShowBreakthrough(true)} onNpcInteraction={npcInteraction} onToggleAttention={toggleAttention} /></div>}
+        {isNarrow && !showActions && <div className={`mobile-only-panel ${tab === "actions" ? "active" : ""}`}><ActionSidebar game={game} onAction={action} onMarket={openMarket} onBreakthrough={() => setShowBreakthrough(true)} onAcceptQuest={acceptQuestAction} onAdvanceQuest={advanceQuestAction} onNpcInteraction={npcInteraction} onToggleAttention={toggleAttention} /></div>}
         <div className={`mobile-only-panel ${tab === "legacy" ? "active" : ""}`}><GoalPanel game={game} /><LegacyPanel meta={meta} /></div>
       </div>
       {(aiBusy || aiNotice) && <div className={`ai-status ${aiBusy ? "working" : "notice"}`} role="status">{aiBusy ? <><Bot size={15} />AI 正在处理当前叙事……</> : <><Bot size={15} />{aiNotice}</>}</div>}
       <nav className="mobile-nav" aria-label="主要视图">
-        {([{ id: "journey", icon: ScrollText, label: "历程" }, { id: "map", icon: MapIcon, label: "舆图" }, { id: "npcs", icon: Users, label: "人物志" }, { id: "actions", icon: ListChecks, label: "行动" }, { id: "inventory", icon: Backpack, label: "物品栏" }, { id: "character", icon: UserRound, label: "人物" }, { id: "legacy", icon: History, label: "详情" }] as const).map(({ id, icon: Icon, label }) => <button key={id} type="button" className={tab === id ? "active" : ""} onClick={() => setTab(id)}><Icon size={20} /><span>{label}</span></button>)}
+        {([{ id: "journey", icon: ScrollText, label: "历程" }, { id: "map", icon: MapIcon, label: "舆图" }, { id: "npcs", icon: Users, label: "人物志" }, { id: "quests", icon: ListChecks, label: "任务" }, { id: "actions", icon: ListChecks, label: "行动" }, { id: "inventory", icon: Backpack, label: "物品栏" }, { id: "character", icon: UserRound, label: "人物" }, { id: "legacy", icon: History, label: "详情" }] as const).map(({ id, icon: Icon, label }) => <button key={id} type="button" className={tab === id ? "active" : ""} onClick={() => setTab(id)}><Icon size={20} /><span>{label}</span></button>)}
       </nav>
       {game.pendingEventId && <PendingEvent game={game} onChoose={choose} busy={aiBusy} />}
+      {game.pendingQuestId && <PendingQuest game={game} onChoose={chooseQuest} busy={aiBusy} />}
       {game.eventResult && <EventResultDialog result={game.eventResult} onClose={() => onGame(dismissEventResult(game))} />}
       {aiBusy && <AiWorkingDialog />}
       {showBreakthrough && <BreakthroughDialog game={game} onClose={() => setShowBreakthrough(false)} onConfirm={commitBreakthrough} />}
@@ -1031,12 +1414,18 @@ export default function App() {
   const [game, setGame] = useState<GameState | null>(() => loadGame());
   const [meta, setMeta] = useState<MetaProgress>(() => loadMeta());
   const [aiSettings, setAiSettings] = useState<AiSettings>(() => loadAiSettings());
+  const [theme, setTheme] = useState<ThemeMode>(() => loadTheme());
   const [screen, setScreen] = useState<Screen>(() => loadGame() ? "welcome" : "create");
   const [saveOpen, setSaveOpen] = useState(false);
   useEffect(() => { saveGame(game); }, [game]);
   useEffect(() => { saveMeta(meta); }, [meta]);
   useEffect(() => { saveAiSettings(aiSettings); }, [aiSettings]);
-  const begin = (candidate: CharacterCandidate, name: string, seed: number, worldOptions: WorldOptions) => { setGame(startGame(candidate, name, seed, worldOptions)); setScreen("game"); };
+  useEffect(() => {
+    document.documentElement.dataset.theme = theme;
+    document.documentElement.style.colorScheme = theme;
+    try { window.localStorage.setItem(THEME_STORAGE_KEY, theme); } catch { /* storage may be unavailable in private browsing */ }
+  }, [theme]);
+  const begin = (candidate: CharacterCandidate, name: string, seed: number, worldOptions: WorldOptions, gender: CharacterGender, traits: TraitDefinition[]) => { setGame(startGame(candidate, name, seed, worldOptions, gender, traits)); setScreen("game"); };
   const newRun = () => { setGame(null); setScreen("create"); setSaveOpen(false); };
   const importAll = (importedGame: GameState | null, importedMeta: MetaProgress) => { setGame(importedGame); setMeta(importedMeta); setScreen(importedGame ? "game" : "create"); setSaveOpen(false); };
   const openCreation = () => {
@@ -1044,11 +1433,11 @@ export default function App() {
     setScreen("create");
   };
   return (
-    <div className="app">
+    <div className="app" data-theme={theme}>
       {screen === "welcome" && <WelcomeScreen game={game} meta={meta} onContinue={() => setScreen("game")} onCreate={openCreation} onManage={() => setSaveOpen(true)} />}
-      {screen === "create" && <CreationScreen meta={meta} onBack={() => setScreen("welcome")} onStart={begin} />}
-      {screen === "game" && game && <GameScreen game={game} meta={meta} aiSettings={aiSettings} onAiSettingsChange={setAiSettings} onGame={setGame} onMeta={setMeta} onHome={() => setScreen("welcome")} onReincarnate={newRun} onManage={() => setSaveOpen(true)} />}
-      {saveOpen && <SaveDialog game={game} meta={meta} aiSettings={aiSettings} onAiSettingsChange={setAiSettings} onClose={() => setSaveOpen(false)} onImport={importAll} onNew={newRun} />}
+      {screen === "create" && <CreationScreen meta={meta} aiSettings={aiSettings} onBack={() => setScreen("welcome")} onStart={begin} />}
+      {screen === "game" && game && <GameScreen game={game} meta={meta} theme={theme} onThemeChange={setTheme} aiSettings={aiSettings} onAiSettingsChange={setAiSettings} onGame={setGame} onMeta={setMeta} onHome={() => setScreen("welcome")} onReincarnate={newRun} onManage={() => setSaveOpen(true)} />}
+      {saveOpen && <SaveDialog game={game} meta={meta} theme={theme} onThemeChange={setTheme} aiSettings={aiSettings} onAiSettingsChange={setAiSettings} onClose={() => setSaveOpen(false)} onImport={importAll} onNew={newRun} />}
     </div>
   );
 }

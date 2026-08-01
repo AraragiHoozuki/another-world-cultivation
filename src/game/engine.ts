@@ -1,8 +1,11 @@
-import { ACTIONS, EVENTS, INITIAL_INVENTORY, LOCATION_POOLS, NPC_GIVEN_NAMES, NPC_INTERACTIONS, NPC_PERSONALITIES, NPC_SURNAMES, ORIGINS, REALMS, SPIRIT_ROOTS, TALENTS, eventMap, identityForRole, NPC_IDENTITIES, itemMap } from "./data";
+import { ACTIONS, EVENTS, INITIAL_INVENTORY, ITEMS, LOCATION_POOLS, NPC_GIVEN_NAMES, NPC_INTERACTIONS, NPC_PERSONALITIES, NPC_SURNAMES, ORIGINS, QUESTS, REALMS, SPIRIT_ROOTS, TALENTS, TRAITS, eventMap, identityForRole, NPC_IDENTITIES, itemMap, questMap } from "./data";
 import type {
   ActionId,
+  AiGeneratedContentBundle,
+  AiGeneratedLocationDraft,
   AiGeneratedOutcome,
   CharacterCandidate,
+  CharacterGender,
   ChronicleEntry,
   CoreStats,
   Effect,
@@ -21,17 +24,24 @@ import type {
   NpcGender,
   NpcInteractionId,
   NpcRelationshipType,
+  QuestChoice,
+  QuestDefinition,
+  QuestOffer,
+  QuestProgress,
+  QuestStageDefinition,
   Requirement,
   ResourceKey,
   Resources,
   RunSummary,
   Tone,
+  TraitDefinition,
+  TraitRarity,
   WorldLocation,
   WorldMapState,
   WorldOptions,
 } from "./types";
 
-export const DEFAULT_WORLD_OPTIONS: WorldOptions = { size: "medium", danger: "balanced", locationCount: 7 };
+export const DEFAULT_WORLD_OPTIONS: WorldOptions = { size: "medium", danger: "balanced", locationCount: 7, aiContentChance: 0.3 };
 export const DAYS_PER_YEAR = 365;
 const CULTIVATION_QI_COST_PER_DAY = 2;
 const CULTIVATION_MIND_COST_PER_DAY = 1;
@@ -98,10 +108,30 @@ export const emptyMeta = (): MetaProgress => ({
   version: 1,
   totalInsight: 0,
   completedRuns: 0,
+  simulationLevel: 1,
   victories: 0,
   discoveredEvents: [],
   bestScore: 0,
 });
+
+export interface SimulationProgression {
+  level: number;
+  optionCount: number;
+  startingCost: number;
+  refreshCost: number;
+  rarityLuck: number;
+}
+
+export function getSimulationProgression(meta: MetaProgress): SimulationProgression {
+  const level = Math.max(1, Math.min(20, Math.round(meta.simulationLevel ?? meta.completedRuns + 1)));
+  return {
+    level,
+    optionCount: Math.min(12, 5 + Math.min(7, level - 1)),
+    startingCost: 8 + (level - 1) * 2,
+    refreshCost: 1 + Math.floor((level - 1) / 4),
+    rarityLuck: level - 1,
+  };
+}
 
 const baseStats = (): CoreStats => ({ constitution: 4, insight: 4, spirit: 4, fortune: 4 });
 const baseResources = (): Resources => ({
@@ -132,6 +162,15 @@ export function nextRandom(state: number): [number, number] {
   return [next / 4294967296, next];
 }
 
+/** Consume one deterministic roll to decide whether an event creates new AI-authored content. */
+export function rollAiContentChance(game: GameState): { game: GameState; shouldGenerate: boolean } {
+  const chance = Math.max(0, Math.min(1, game.world.options?.aiContentChance ?? DEFAULT_WORLD_OPTIONS.aiContentChance ?? 0));
+  let roll: number;
+  let rngState: number;
+  [roll, rngState] = nextRandom(game.rngState);
+  return { game: { ...game, rngState }, shouldGenerate: roll < chance };
+}
+
 function draw<T>(items: T[], state: number): [T, number] {
   const [roll, next] = nextRandom(state);
   return [items[Math.floor(roll * items.length)] ?? items[0], next];
@@ -141,9 +180,85 @@ function addPartial<T extends object>(base: T, patch?: Partial<T>): T {
   const result = { ...base };
   if (patch) Object.entries(patch).forEach(([key, value]) => {
     const typedKey = key as keyof T;
-    result[typedKey] = ((result[typedKey] as number) + (value as number)) as T[keyof T];
+    if (typeof value !== "number" || !Number.isFinite(value)) return;
+    const baseValue = result[typedKey];
+    const numericBase = typeof baseValue === "number" && Number.isFinite(baseValue) ? baseValue : 0;
+    result[typedKey] = (numericBase + value) as T[keyof T];
   });
   return result;
+}
+
+const TRAIT_RARITY_WEIGHTS: Record<TraitRarity, number> = {
+  gray: 34,
+  white: 29,
+  green: 20,
+  blue: 11,
+  purple: 5,
+  rainbow: 1,
+};
+
+function weightedTraitDraw(pool: TraitDefinition[], rngState: number, luck: number): [TraitDefinition, number] {
+  const total = pool.reduce((sum, trait) => {
+    const rarityIndex = ["gray", "white", "green", "blue", "purple", "rainbow"].indexOf(trait.rarity);
+    return sum + TRAIT_RARITY_WEIGHTS[trait.rarity] * (1 + luck * rarityIndex * 0.12);
+  }, 0);
+  let roll: number; let rng: number;
+  [roll, rng] = nextRandom(rngState);
+  let cursor = roll * total;
+  for (const trait of pool) {
+    const rarityIndex = ["gray", "white", "green", "blue", "purple", "rainbow"].indexOf(trait.rarity);
+    cursor -= TRAIT_RARITY_WEIGHTS[trait.rarity] * (1 + luck * rarityIndex * 0.12);
+    if (cursor <= 0) return [trait, rng];
+  }
+  return [pool[pool.length - 1] ?? TRAITS[0], rng];
+}
+
+export function createTraitOptions(seed: number, meta: MetaProgress): TraitDefinition[] {
+  const progression = getSimulationProgression(meta);
+  let rng = (seed ^ 0x7f4a7c15 ^ (progression.level * 0x45d9f3b)) >>> 0 || 0x2468ace1;
+  const options: TraitDefinition[] = [];
+  while (options.length < progression.optionCount && options.length < TRAITS.length) {
+    const available = TRAITS.filter((trait) => !options.some((option) => option.id === trait.id));
+    const [trait, next] = weightedTraitDraw(available, rng, progression.rarityLuck);
+    rng = next;
+    if (!trait) break;
+    options.push(trait);
+  }
+  return options;
+}
+
+export function applyStartingTraits(candidate: CharacterCandidate, traits: TraitDefinition[]): CharacterCandidate {
+  const selected = Array.from(new Map(traits.filter((trait) => trait && typeof trait.id === "string").map((trait) => [trait.id, trait])).values());
+  const traitStats = selected.reduce((stats, trait) => addPartial(stats, trait.stats), {} as CoreStats);
+  const traitResources = selected.reduce((resources, trait) => addPartial(resources, trait.resources), {} as Partial<Resources>);
+  const finiteBonus = (value: unknown) => typeof value === "number" && Number.isFinite(value) ? value : 0;
+  const traitCultivation = selected.reduce((sum, trait) => sum + finiteBonus(trait.cultivationBonus), 0);
+  const traitAlchemy = selected.reduce((sum, trait) => sum + finiteBonus(trait.alchemyBonus), 0);
+  const traitExploration = selected.reduce((sum, trait) => sum + finiteBonus(trait.explorationBonus), 0);
+  const traitDanger = selected.reduce((sum, trait) => sum + finiteBonus(trait.dangerModifier), 0);
+  const stats = addPartial(candidate.stats, traitStats);
+  const resources = addPartial(candidate.resources, traitResources);
+  resources.maxStamina = Math.max(resources.maxStamina, resources.maxHealth);
+  resources.maxHealth = resources.maxStamina;
+  resources.stamina = Math.max(0, Math.min(resources.maxStamina, resources.stamina));
+  resources.health = resources.stamina;
+  resources.maxQi = Math.max(1, resources.maxQi);
+  resources.qi = Math.max(0, Math.min(resources.maxQi, resources.qi));
+  resources.maxMind = Math.max(1, resources.maxMind);
+  resources.mind = Math.max(0, Math.min(resources.maxMind, resources.mind));
+  resources.battlePower += (traitStats.constitution ?? 0) * 4 + (traitStats.spirit ?? 0) * 2;
+  return {
+    ...candidate,
+    stats,
+    resources,
+    spiritRoot: {
+      ...candidate.spiritRoot,
+      cultivationBonus: candidate.spiritRoot.cultivationBonus + traitCultivation,
+      alchemyBonus: (candidate.spiritRoot.alchemyBonus ?? 0) + traitAlchemy,
+      explorationBonus: (candidate.spiritRoot.explorationBonus ?? 0) + traitExploration,
+    },
+    talent: { ...candidate.talent, dangerModifier: (candidate.talent.dangerModifier ?? 0) + traitDanger },
+  };
 }
 
 export function createCandidates(seed: number, meta: MetaProgress): CharacterCandidate[] {
@@ -340,15 +455,17 @@ export function generateNpcs(seed: number, locations: WorldLocation[]): Npc[] {
 
 const RESOURCE_ITEM_IDS = { herbs: "spirit-herb", pills: "barrier-pill" } as const;
 
-export function startGame(candidate: CharacterCandidate, name: string, seed: number, worldOptions: WorldOptions = DEFAULT_WORLD_OPTIONS): GameState {
+export function startGame(candidate: CharacterCandidate, name: string, seed: number, worldOptions: WorldOptions = DEFAULT_WORLD_OPTIONS, gender: CharacterGender = "unknown", startingTraits: TraitDefinition[] = []): GameState {
+  const enrichedCandidate = applyStartingTraits(candidate, startingTraits);
   const world = generateWorld(seed, worldOptions);
   const inventoryMap = new Map(INITIAL_INVENTORY.map((entry) => [entry.itemId, entry.quantity]));
   (Object.keys(RESOURCE_ITEM_IDS) as Array<keyof typeof RESOURCE_ITEM_IDS>).forEach((resourceKey) => {
     const itemId = RESOURCE_ITEM_IDS[resourceKey];
-    const quantity = Math.max(0, Math.floor(candidate.resources[resourceKey] ?? 0));
+    const quantity = Math.max(0, Math.floor(enrichedCandidate.resources[resourceKey] ?? 0));
     if (quantity > 0) inventoryMap.set(itemId, (inventoryMap.get(itemId) ?? 0) + quantity);
   });
-  return {
+  const normalizedTraits = Array.from(new Map(startingTraits.filter((trait) => trait && typeof trait.id === "string").map((trait) => [trait.id, trait])).values());
+  const game: GameState = {
     version: 1,
     seed,
     rngState: seed >>> 0 || 0x12345678,
@@ -359,19 +476,63 @@ export function startGame(candidate: CharacterCandidate, name: string, seed: num
     npcs: generateNpcs(seed, world.locations),
     character: {
       name: name.trim() || "无名",
-      origin: candidate.origin,
-      spiritRoot: candidate.spiritRoot,
-      talent: candidate.talent,
-      stats: candidate.stats,
+      gender,
+      origin: enrichedCandidate.origin,
+      spiritRoot: enrichedCandidate.spiritRoot,
+      talent: enrichedCandidate.talent,
+      stats: enrichedCandidate.stats,
+      traits: normalizedTraits,
     },
-    resources: { ...candidate.resources },
+    resources: { ...enrichedCandidate.resources },
     inventory: Array.from(inventoryMap, ([itemId, quantity]) => ({ itemId, quantity })),
     statuses: [],
     flags: [],
     seenEvents: {},
+    questOffers: [],
+    quests: [],
+    generatedQuests: [],
+    generatedEvents: [],
+    generatedItems: [],
     chronicle: [{ id: "arrival", turn: 0, title: "坠入异界", text: "醒来时，你掌心多了一道界蚀印。没有天命，也没有期限；这一生要走向哪里，由你自己决定。", tone: "mystic" }],
     legacyClaimed: false,
   };
+  return initializeQuestSystem(game);
+}
+
+function hasPendingNarrative(game: GameState): boolean {
+  return Boolean(game.pendingEventId || game.pendingQuestId);
+}
+
+function itemDefinitions(game: GameState): ItemDefinition[] {
+  return [...ITEMS, ...(game.generatedItems ?? [])].filter((item, index, items) => items.findIndex((candidate) => candidate.id === item.id) === index);
+}
+
+function itemDefinitionFor(game: GameState, itemId: string): ItemDefinition | undefined {
+  return itemDefinitions(game).find((item) => item.id === itemId);
+}
+
+export function getItems(game: GameState): ItemDefinition[] {
+  return itemDefinitions(game);
+}
+
+function eventDefinitions(game: GameState): EventDefinition[] {
+  return [...EVENTS, ...(game.generatedEvents ?? [])].filter((event, index, events) => events.findIndex((candidate) => candidate.id === event.id) === index);
+}
+
+function eventDefinitionFor(game: GameState, eventId: string): EventDefinition | undefined {
+  return eventDefinitions(game).find((event) => event.id === eventId);
+}
+
+export function getEventDefinition(game: GameState, eventId: string): EventDefinition | undefined {
+  return eventDefinitionFor(game, eventId);
+}
+
+function questDefinitions(game: GameState): QuestDefinition[] {
+  return [...QUESTS, ...(game.generatedQuests ?? [])].filter((quest, index, quests) => quests.findIndex((candidate) => candidate.id === quest.id) === index);
+}
+
+function questDefinitionFor(game: GameState, questId: string): QuestDefinition | undefined {
+  return questDefinitions(game).find((quest) => quest.id === questId);
 }
 
 function effectiveStats(game: GameState): CoreStats {
@@ -450,8 +611,10 @@ function itemActionResult(before: GameState, after: GameState, title: string, te
   return checkEnding(next);
 }
 
-export function getItem(itemId: string): ItemDefinition | undefined {
-  return itemMap.get(itemId);
+export function getItem(itemId: string): ItemDefinition | undefined;
+export function getItem(game: GameState, itemId: string): ItemDefinition | undefined;
+export function getItem(gameOrId: GameState | string, itemId?: string): ItemDefinition | undefined {
+  return typeof gameOrId === "string" ? itemMap.get(gameOrId) : itemDefinitionFor(gameOrId, itemId ?? "");
 }
 
 export function getItemQuantity(game: GameState, itemId: string): number {
@@ -461,8 +624,8 @@ export function getItemQuantity(game: GameState, itemId: string): number {
 }
 
 export function canUseItem(game: GameState, itemId: string): { allowed: boolean; reason?: string } {
-  if (game.status !== "playing" || game.pendingEventId) return { allowed: false, reason: "请先处理眼前之事" };
-  const item = itemMap.get(itemId);
+  if (game.status !== "playing" || hasPendingNarrative(game)) return { allowed: false, reason: "请先处理眼前之事" };
+  const item = itemDefinitionFor(game, itemId);
   if (!item) return { allowed: false, reason: "没有此物品" };
   if (item.category !== "consumable" || !item.effects?.length) return { allowed: false, reason: "此物品不能直接使用" };
   if (inventoryQuantity(game, itemId) < 1) return { allowed: false, reason: "物品栏中没有此物品" };
@@ -470,13 +633,13 @@ export function canUseItem(game: GameState, itemId: string): { allowed: boolean;
 }
 
 function canTrade(game: GameState): { allowed: boolean; reason?: string } {
-  if (game.status !== "playing" || game.pendingEventId) return { allowed: false, reason: "请先处理眼前之事" };
+  if (game.status !== "playing" || hasPendingNarrative(game)) return { allowed: false, reason: "请先处理眼前之事" };
   if (!actionAvailable(getCurrentLocation(game), "market")) return { allowed: false, reason: "抵达提供坊市交易的地点后方可交易" };
   return { allowed: true };
 }
 
 export function canBuyItem(game: GameState, itemId: string, quantity = 1): { allowed: boolean; reason?: string } {
-  const item = itemMap.get(itemId);
+  const item = itemDefinitionFor(game, itemId);
   if (!item) return { allowed: false, reason: "没有此物品" };
   const trade = canTrade(game);
   if (!trade.allowed) return trade;
@@ -487,7 +650,7 @@ export function canBuyItem(game: GameState, itemId: string, quantity = 1): { all
 }
 
 export function canSellItem(game: GameState, itemId: string, quantity = 1): { allowed: boolean; reason?: string } {
-  const item = itemMap.get(itemId);
+  const item = itemDefinitionFor(game, itemId);
   if (!item) return { allowed: false, reason: "没有此物品" };
   const trade = canTrade(game);
   if (!trade.allowed) return trade;
@@ -498,8 +661,8 @@ export function canSellItem(game: GameState, itemId: string, quantity = 1): { al
 }
 
 export function canGiftItem(game: GameState, npcId: string, itemId: string, quantity = 1): { allowed: boolean; reason?: string } {
-  if (game.status !== "playing" || game.pendingEventId) return { allowed: false, reason: "请先处理眼前之事" };
-  const item = itemMap.get(itemId);
+  if (game.status !== "playing" || hasPendingNarrative(game)) return { allowed: false, reason: "请先处理眼前之事" };
+  const item = itemDefinitionFor(game, itemId);
   if (!item) return { allowed: false, reason: "没有此物品" };
   if (item.category === "quest") return { allowed: false, reason: "剧情物品不能随意转赠" };
   const npc = game.npcs.find((entry) => entry.id === npcId);
@@ -511,7 +674,7 @@ export function canGiftItem(game: GameState, npcId: string, itemId: string, quan
 
 export function useItem(game: GameState, itemId: string): GameState {
   const access = canUseItem(game, itemId);
-  const item = itemMap.get(itemId);
+  const item = itemDefinitionFor(game, itemId);
   if (!access.allowed || !item) return game;
   const before = game;
   let next = changeInventory(game, itemId, -1);
@@ -522,7 +685,7 @@ export function useItem(game: GameState, itemId: string): GameState {
 export function buyItem(game: GameState, itemId: string, quantity = 1): GameState {
   const count = Math.max(1, Math.floor(quantity));
   const access = canBuyItem(game, itemId, count);
-  const item = itemMap.get(itemId);
+  const item = itemDefinitionFor(game, itemId);
   if (!access.allowed || !item) return game;
   const before = game;
   let next = game;
@@ -534,7 +697,7 @@ export function buyItem(game: GameState, itemId: string, quantity = 1): GameStat
 export function sellItem(game: GameState, itemId: string, quantity = 1): GameState {
   const count = Math.max(1, Math.floor(quantity));
   const access = canSellItem(game, itemId, count);
-  const item = itemMap.get(itemId);
+  const item = itemDefinitionFor(game, itemId);
   if (!access.allowed || !item) return game;
   const before = game;
   let next = game;
@@ -546,7 +709,7 @@ export function sellItem(game: GameState, itemId: string, quantity = 1): GameSta
 export function giftItem(game: GameState, npcId: string, itemId: string, quantity = 1): GameState {
   const count = Math.max(1, Math.floor(quantity));
   const access = canGiftItem(game, npcId, itemId, count);
-  const item = itemMap.get(itemId);
+  const item = itemDefinitionFor(game, itemId);
   const npc = game.npcs.find((entry) => entry.id === npcId);
   if (!access.allowed || !item || !npc) return game;
   const before = game;
@@ -608,7 +771,7 @@ function eventChanges(before: GameState, after: GameState): EventResultChange[] 
   const inventoryAfter = new Map((after.inventory ?? []).map((entry) => [entry.itemId, entry.quantity]));
   new Set([...inventoryBefore.keys(), ...inventoryAfter.keys()]).forEach((itemId) => {
     const amount = (inventoryAfter.get(itemId) ?? 0) - (inventoryBefore.get(itemId) ?? 0);
-    const item = itemMap.get(itemId);
+    const item = itemDefinitionFor(before, itemId) ?? itemDefinitionFor(after, itemId);
     if (amount !== 0 && item) changes.push(itemChange(item, amount));
   });
   (Object.keys(eventStatLabels) as Array<keyof CoreStats>).forEach((key) => {
@@ -623,7 +786,11 @@ function withResult(before: GameState, after: GameState, title: string, text: st
 }
 
 function addLog(game: GameState, title: string, text: string, tone: Tone = "neutral", details: Pick<ChronicleEntry, "kind" | "detail" | "locationName" | "changes" | "durationDays"> = {}): GameState {
-  const entry: ChronicleEntry = { id: `${game.turn}-${game.rngState}-${game.chronicle.length}`, turn: game.turn, title, text, tone, ...details };
+  const baseId = `${game.turn}-${game.rngState}-${game.chronicle.length}`;
+  let id = baseId;
+  let suffix = 1;
+  while (game.chronicle.some((entry) => entry.id === id)) id = `${baseId}-${suffix++}`;
+  const entry: ChronicleEntry = { id, turn: game.turn, title, text, tone, ...details };
   return { ...game, chronicle: [entry, ...game.chronicle].slice(0, 60) };
 }
 
@@ -660,7 +827,7 @@ function actionAvailable(location: WorldLocation, actionId: ActionId): boolean {
 }
 
 export function canPerformAction(game: GameState, actionId: ActionId, requestedDurationDays?: number): { allowed: boolean; reason?: string } {
-  if (game.status !== "playing" || game.pendingEventId) return { allowed: false, reason: "先处理眼前之事" };
+  if (game.status !== "playing" || hasPendingNarrative(game)) return { allowed: false, reason: "先处理眼前之事" };
   const location = getCurrentLocation(game);
   const action = ACTIONS.find((item) => item.id === actionId);
   if (!action) return { allowed: false, reason: "没有这种行动" };
@@ -753,7 +920,7 @@ function tick(game: GameState, elapsedDays = 1): GameState {
       kind: "event",
       durationDays: days,
     });
-  return {
+  const next: GameState = {
     ...game,
     turn: game.turn + days,
     rngState: npcLife.rngState,
@@ -762,6 +929,7 @@ function tick(game: GameState, elapsedDays = 1): GameState {
     npcs: npcLife.npcs,
     chronicle: lifeEntries.length ? [...lifeEntries, ...game.chronicle].slice(0, 60) : game.chronicle,
   };
+  return refreshQuestOffers(expireActiveQuests(next), days, false);
 }
 
 function actionOutcome(game: GameState, actionId: ActionId, durationDays: number): [GameState, string, Tone] {
@@ -812,7 +980,7 @@ function actionOutcome(game: GameState, actionId: ActionId, durationDays: number
 
 function finishAction(game: GameState, actionId: ActionId, durationDays: number, generated?: AiGeneratedOutcome): GameState {
   const action = ACTIONS.find((item) => item.id === actionId)!;
-  let next = tick({ ...game, pendingEventId: undefined }, durationDays);
+  let next = tick({ ...game, pendingEventId: undefined, pendingQuestId: undefined }, durationDays);
   let message: string;
   let tone: Tone;
   let title = action.name;
@@ -858,7 +1026,7 @@ function worldDangerModifier(game: GameState): number {
 
 function selectEvent(game: GameState, trigger: EventTrigger): [string | undefined, number] {
   if (trigger === "market") return ["market-day", game.rngState];
-  const eligible = EVENTS.filter((event) => event.id !== "market-day" && eventEligible(event, game, trigger));
+  const eligible = eventDefinitions(game).filter((event) => event.id !== "market-day" && eventEligible(event, game, trigger));
   if (!eligible.length) return [undefined, game.rngState];
   const total = eligible.reduce((sum, event) => sum + (event.weight ?? 1), 0);
   let roll; let rng; [roll, rng] = nextRandom(game.rngState);
@@ -868,6 +1036,388 @@ function selectEvent(game: GameState, trigger: EventTrigger): [string | undefine
     if (cursor <= 0) return [event.id, rng];
   }
   return [eligible[eligible.length - 1].id, rng];
+}
+
+function questRolesSupported(game: GameState, roles?: LocationRole[]): boolean {
+  return !roles?.length || roles.some((role) => game.world.locations.some((location) => location.role === role));
+}
+
+function questSupportedByWorld(game: GameState, quest: QuestDefinition): boolean {
+  return quest.stages.every((stage) => {
+    if (!questRolesSupported(game, stage.locationRoles)) return false;
+    const objectiveRoles = stage.objective?.type === "visit" || stage.objective?.type === "resource" ? stage.objective.locationRoles : undefined;
+    return questRolesSupported(game, objectiveRoles);
+  });
+}
+
+function questAlreadyKnown(game: GameState, quest: QuestDefinition): boolean {
+  if (game.questOffers.some((offer) => offer.questId === quest.id)) return true;
+  return game.quests.some((progress) => progress.questId === quest.id && (progress.status === "active" || quest.once !== false));
+}
+
+function questEligibleForOffer(game: GameState, quest: QuestDefinition, location?: WorldLocation): boolean {
+  if (game.status !== "playing" || questAlreadyKnown(game, quest)) return false;
+  if (quest.minStage && game.realmStage < quest.minStage) return false;
+  if (quest.maxStage && game.realmStage > quest.maxStage) return false;
+  if (quest.requireFlag && !game.flags.includes(quest.requireFlag)) return false;
+  if (quest.excludeFlag && game.flags.includes(quest.excludeFlag)) return false;
+  if (location && !quest.offerRoles.includes(location.role)) return false;
+  return questSupportedByWorld(game, quest);
+}
+
+function chooseQuest(quests: QuestDefinition[], rngState: number): [QuestDefinition | undefined, number] {
+  if (!quests.length) return [undefined, rngState];
+  const total = quests.reduce((sum, quest) => sum + (quest.weight ?? 1), 0);
+  let roll; let rng; [roll, rng] = nextRandom(rngState);
+  let cursor = roll * total;
+  for (const quest of quests) {
+    cursor -= quest.weight ?? 1;
+    if (cursor <= 0) return [quest, rng];
+  }
+  return [quests[quests.length - 1], rng];
+}
+
+function addQuestOffer(game: GameState, quest: QuestDefinition, location: WorldLocation): GameState {
+  const lifetime = Math.max(16, Math.min(60, Math.round((quest.timeLimitDays ?? 30) * .8)));
+  const offer: QuestOffer = { questId: quest.id, locationId: location.id, discoveredTurn: game.turn, expiresTurn: game.turn + lifetime };
+  return { ...game, questOffers: [...game.questOffers, offer] };
+}
+
+function refreshQuestOffers(game: GameState, elapsedDays = 1, initial = false): GameState {
+  if (game.status !== "playing") return game;
+  let next: GameState = {
+    ...game,
+    questOffers: (game.questOffers ?? []).filter((offer) => offer.expiresTurn >= game.turn && questDefinitionFor(game, offer.questId) && game.world.locations.some((location) => location.id === offer.locationId)),
+    quests: game.quests ?? [],
+  };
+  const availableLocations = next.world.locations.filter((location) => location.unlockStage <= next.realmStage && !next.questOffers.some((offer) => offer.locationId === location.id));
+
+  // Story follow-ups appear as soon as their prerequisite flag exists.
+  for (const quest of questDefinitions(next).filter((candidate) => Boolean(candidate.requireFlag) && questEligibleForOffer(next, candidate))) {
+    const location = availableLocations.find((candidate) => quest.offerRoles.includes(candidate.role) && !next.questOffers.some((offer) => offer.locationId === candidate.id));
+    if (location) next = addQuestOffer(next, quest, location);
+  }
+
+  const desiredOffers = Math.min(8, Math.max(2, Math.ceil(next.world.locations.length / 16) + 2));
+  const spawnChance = initial ? 1 : Math.min(.82, .06 + Math.max(1, elapsedDays) * .035);
+  const candidates = availableLocations.filter((location) => !next.questOffers.some((offer) => offer.locationId === location.id));
+  while (next.questOffers.length < desiredOffers && candidates.length) {
+    let locationRoll; [locationRoll, next.rngState] = nextRandom(next.rngState);
+    const locationIndex = Math.min(candidates.length - 1, Math.floor(locationRoll * candidates.length));
+    const [location] = candidates.splice(locationIndex, 1);
+    let spawnRoll; [spawnRoll, next.rngState] = nextRandom(next.rngState);
+    if (spawnRoll > spawnChance) continue;
+    const eligible = questDefinitions(next).filter((quest) => questEligibleForOffer(next, quest, location));
+    let quest; [quest, next.rngState] = chooseQuest(eligible, next.rngState);
+    if (quest) next = addQuestOffer(next, quest, location);
+  }
+  return next;
+}
+
+function generatedLocationPosition(existing: WorldLocation[], anchor: WorldLocation, rngState: number): [{ x: number; y: number }, number] {
+  // The map renders cards in percentage coordinates. Keep a larger exclusion
+  // radius in small worlds, where each card occupies more of the canvas, and
+  // relax it only for dense worlds whose map layer is already much larger.
+  const minimumDistance = existing.length > 60 ? 9 : existing.length > 24 ? 12 : 17;
+  const minimumDistanceSquared = minimumDistance ** 2;
+  const clampX = (value: number) => Math.max(7, Math.min(93, value));
+  const clampY = (value: number) => Math.max(12, Math.min(88, value));
+  const score = (x: number, y: number) => existing.reduce((minimum, location) => Math.min(minimum, (location.position.x - x) ** 2 + (location.position.y - y) ** 2), Number.POSITIVE_INFINITY);
+  let rng = rngState;
+  let bestPosition = { x: clampX(anchor.position.x + minimumDistance), y: clampY(anchor.position.y) };
+  let bestScore = score(bestPosition.x, bestPosition.y);
+  // Sample enough directions to find an open pocket even when the current
+  // location sits near a map edge. The best candidate is retained as a safe
+  // fallback if the world is already unusually dense.
+  for (let attempt = 0; attempt < 72; attempt += 1) {
+    let angleRoll; let distanceRoll;
+    [angleRoll, rng] = nextRandom(rng);
+    [distanceRoll, rng] = nextRandom(rng);
+    const angle = angleRoll * Math.PI * 2;
+    const distance = minimumDistance * (1.15 + distanceRoll * 1.55);
+    const x = clampX(anchor.position.x + Math.cos(angle) * distance);
+    const y = clampY(anchor.position.y + Math.sin(angle) * distance);
+    const candidateScore = score(x, y);
+    if (candidateScore > bestScore) {
+      bestScore = candidateScore;
+      bestPosition = { x, y };
+    }
+    if (candidateScore >= minimumDistanceSquared) return [{ x, y }, rng];
+  }
+  return [bestPosition, rng];
+}
+
+function defaultGeneratedLocationActions(role: LocationRole): ActionId[] {
+  if (role === "herbal" || role === "water" || role === "mine") return ["gather"];
+  if (role === "market" || role === "settlement") return ["market"];
+  if (role === "sect" || role === "academy" || role === "sanctuary") return ["cultivate"];
+  return ["explore"];
+}
+
+export function addGeneratedContent(game: GameState, bundle: AiGeneratedContentBundle, announce = true): GameState {
+  if (game.status !== "playing") return game;
+  let next: GameState = {
+    ...game,
+    world: { ...game.world, locations: game.world.locations.map((location) => ({ ...location, actions: [...location.actions], connections: [...location.connections], position: { ...location.position } })) },
+    npcs: [...game.npcs],
+    generatedQuests: [...(game.generatedQuests ?? [])],
+    generatedEvents: [...(game.generatedEvents ?? [])],
+    generatedItems: [...(game.generatedItems ?? [])],
+  };
+  let rng = next.rngState;
+  const existingIds = new Set(next.world.locations.map((location) => location.id));
+  const current = getCurrentLocation(next);
+  const createdLocations: WorldLocation[] = [];
+  bundle.locations.slice(0, 3).forEach((draft) => {
+    if (!draft.id || existingIds.has(draft.id)) return;
+    let position: { x: number; y: number };
+    [position, rng] = generatedLocationPosition([...next.world.locations, ...createdLocations], current, rng);
+    const nearest = [...next.world.locations, ...createdLocations]
+      .filter((location) => location.id !== current.id)
+      .sort((left, right) => {
+        const leftDistance = (left.position.x - position.x) ** 2 + (left.position.y - position.y) ** 2;
+        const rightDistance = (right.position.x - position.x) ** 2 + (right.position.y - position.y) ** 2;
+        return leftDistance - rightDistance;
+      })[0];
+    const location: WorldLocation = {
+      id: draft.id,
+      role: draft.role,
+      name: draft.name,
+      subtitle: draft.subtitle,
+      description: draft.description,
+      danger: draft.danger,
+      icon: draft.icon,
+      actions: draft.actions.length ? [...draft.actions] : defaultGeneratedLocationActions(draft.role),
+      modifiers: locationModifiers({ ...draft, id: draft.id, connections: [], position } as WorldLocation),
+      connections: [current.id, ...(nearest && nearest.id !== current.id ? [nearest.id] : [])],
+      unlockStage: Math.max(1, Math.min(REALMS.length - 1, draft.unlockStage ?? next.realmStage)),
+      travelCost: Math.max(1, Math.min(200, draft.travelCost ?? 5)),
+      position,
+    };
+    createdLocations.push(location);
+    existingIds.add(location.id);
+  });
+  const locationIds = new Set(next.world.locations.map((location) => location.id));
+  createdLocations.forEach((location) => location.connections.forEach((connectionId) => {
+    const target = next.world.locations.find((candidate) => candidate.id === connectionId) ?? createdLocations.find((candidate) => candidate.id === connectionId);
+    if (target && !target.connections.includes(location.id)) target.connections.push(location.id);
+  }));
+  next.world.locations.push(...createdLocations);
+  createdLocations.forEach((location) => locationIds.add(location.id));
+  const existingItemIds = new Set(itemDefinitions(next).map((item) => item.id));
+  const newItems = bundle.items.filter((item) => {
+    if (!item.id || existingItemIds.has(item.id)) return false;
+    existingItemIds.add(item.id);
+    return true;
+  });
+  next.generatedItems.push(...newItems.map((item) => ({ ...item, effects: item.effects ? [...item.effects] : undefined })));
+  const existingEventIds = new Set(eventDefinitions(next).map((event) => event.id));
+  const newEvents = bundle.events.filter((event) => {
+    if (!event.id || existingEventIds.has(event.id)) return false;
+    existingEventIds.add(event.id);
+    return true;
+  });
+  next.generatedEvents.push(...newEvents);
+  const existingQuestIds = new Set(questDefinitions(next).map((quest) => quest.id));
+  const newQuests = bundle.quests.filter((quest) => {
+    if (!quest.id || existingQuestIds.has(quest.id)) return false;
+    existingQuestIds.add(quest.id);
+    return true;
+  });
+  next.generatedQuests.push(...newQuests);
+  const existingNpcIds = new Set(next.npcs.map((npc) => npc.id));
+  const newNpcs = bundle.npcs.filter((npc) => {
+    if (!npc.id || existingNpcIds.has(npc.id)) return false;
+    existingNpcIds.add(npc.id);
+    return true;
+  });
+  next.npcs.push(...newNpcs.map((npc) => ({
+    ...npc,
+    locationId: locationIds.has(npc.locationId) ? npc.locationId : current.id,
+    lifespan: Math.max(npc.age + 1, npc.lifespan),
+    personality: npc.personality.length ? [...npc.personality] : ["沉稳"],
+  })));
+  next.rngState = rng;
+  next.aiContentLastTurn = next.turn;
+  const createdCount = createdLocations.length + newItems.length + newEvents.length + newQuests.length + newNpcs.length;
+  if (!createdCount) return next;
+  const generatedContent = {
+    locations: createdLocations.map((location) => location.name),
+    npcs: newNpcs.map((npc) => npc.name),
+    quests: newQuests.map((quest) => quest.title),
+    events: newEvents.map((event) => event.title),
+    items: newItems.map((item) => item.name),
+  };
+  const text = bundle.narrative || `天机翻页，新的因果正在${current.name}周围成形。${createdLocations.length ? `地图上出现了 ${createdLocations.length} 处新地点。` : ""}`;
+  next = addLog(next, "天机生成新的世界", text, "mystic", { kind: "event", locationName: current.name, detail: "AI 世界内容", durationDays: 0 });
+  if (announce) {
+    next = { ...next, eventResult: { kind: "event", title: "新的世界因果", text, tone: "mystic", changes: [], durationDays: 0, generatedContent } };
+  } else if (next.eventResult) {
+    const previous = next.eventResult.generatedContent;
+    next = {
+      ...next,
+      eventResult: {
+        ...next.eventResult,
+        generatedContent: {
+          locations: [...(previous?.locations ?? []), ...generatedContent.locations],
+          npcs: [...(previous?.npcs ?? []), ...generatedContent.npcs],
+          quests: [...(previous?.quests ?? []), ...generatedContent.quests],
+          events: [...(previous?.events ?? []), ...generatedContent.events],
+          items: [...(previous?.items ?? []), ...generatedContent.items],
+        },
+      },
+    };
+  }
+  return refreshQuestOffers(next, 1, false);
+}
+
+export function initializeQuestSystem(game: GameState): GameState {
+  const rawOffers = Array.isArray((game as Partial<GameState>).questOffers) ? game.questOffers : [];
+  const rawQuests = Array.isArray((game as Partial<GameState>).quests) ? game.quests : [];
+  const generatedQuests = Array.isArray((game as Partial<GameState>).generatedQuests) ? game.generatedQuests : [];
+  const knownQuestIds = new Set([...QUESTS, ...generatedQuests].map((quest) => quest.id));
+  const quests = rawQuests.filter((progress) => progress && typeof progress.questId === "string" && knownQuestIds.has(progress.questId));
+  const offers = rawOffers.filter((offer) => offer && typeof offer.questId === "string" && knownQuestIds.has(offer.questId));
+  const pendingQuestId = typeof game.pendingQuestId === "string" && quests.some((progress) => progress.questId === game.pendingQuestId && progress.status === "active") ? game.pendingQuestId : undefined;
+  const normalized = { ...game, generatedQuests, questOffers: offers, quests, pendingQuestId };
+  return refreshQuestOffers(normalized, 1, offers.length === 0 && quests.length === 0);
+}
+
+function expireActiveQuests(game: GameState): GameState {
+  let next = game;
+  for (const progress of next.quests.filter((quest) => quest.status === "active" && quest.deadlineTurn !== undefined && next.turn > quest.deadlineTurn)) {
+    const definition = questDefinitionFor(next, progress.questId);
+    if (!definition) continue;
+    const before = next;
+    next = applyEffects(next, definition.failureEffects ?? []);
+    const failed: QuestProgress = { ...progress, status: "failed", updatedTurn: next.turn, finishedTurn: next.turn, failureReason: "未能在期限内完成" };
+    next = { ...next, pendingQuestId: next.pendingQuestId === progress.questId ? undefined : next.pendingQuestId, quests: next.quests.map((quest) => quest === progress ? failed : quest) };
+    next = addLog(next, `${definition.title} · 已逾期`, `任务期限已过，这条线索在时间中失去了回应。`, "danger", { kind: "quest", locationName: getCurrentLocation(next).name, changes: eventChanges(before, next), detail: "任务失败：超过期限", durationDays: 0 });
+  }
+  return next;
+}
+
+export function getLocationQuestOffers(game: GameState, locationId = getCurrentLocation(game).id): Array<{ offer: QuestOffer; quest: QuestDefinition }> {
+  return game.questOffers.flatMap((offer) => {
+    const quest = offer.locationId === locationId ? questDefinitionFor(game, offer.questId) : undefined;
+    return quest ? [{ offer, quest }] : [];
+  });
+}
+
+export function getQuestDefinition(game: GameState, questId: string): QuestDefinition | undefined;
+export function getQuestDefinition(questId: string): QuestDefinition | undefined;
+export function getQuestDefinition(gameOrId: GameState | string, questId?: string): QuestDefinition | undefined {
+  return typeof gameOrId === "string" ? questMap.get(gameOrId) : questDefinitionFor(gameOrId, questId ?? "");
+}
+
+export function getQuestStage(game: GameState, questId: string): { quest: QuestDefinition; progress: QuestProgress; stage: QuestStageDefinition } | undefined {
+  const quest = questDefinitionFor(game, questId);
+  const progress = game.quests.find((candidate) => candidate.questId === questId && candidate.status === "active");
+  const stage = quest?.stages[progress?.stageIndex ?? -1];
+  return quest && progress && stage ? { quest, progress, stage } : undefined;
+}
+
+export function getCurrentQuestStage(game: GameState): { quest: QuestDefinition; progress: QuestProgress; stage: QuestStageDefinition } | undefined {
+  return game.pendingQuestId ? getQuestStage(game, game.pendingQuestId) : undefined;
+}
+
+export function canAcceptQuest(game: GameState, questId: string): { allowed: boolean; reason?: string } {
+  if (game.status !== "playing" || hasPendingNarrative(game)) return { allowed: false, reason: "请先处理眼前之事" };
+  const quest = questDefinitionFor(game, questId);
+  if (!quest) return { allowed: false, reason: "任务已经消失" };
+  if (!game.questOffers.some((offer) => offer.questId === questId && offer.locationId === getCurrentLocation(game).id)) return { allowed: false, reason: "需前往任务出现的地点" };
+  if (game.quests.filter((progress) => progress.status === "active").length >= 4) return { allowed: false, reason: "同时最多追踪 4 个任务" };
+  return { allowed: true };
+}
+
+export function acceptQuest(game: GameState, questId: string): GameState {
+  if (!canAcceptQuest(game, questId).allowed) return game;
+  const quest = questDefinitionFor(game, questId)!;
+  const progress: QuestProgress = {
+    questId,
+    status: "active",
+    stageIndex: 0,
+    acceptedTurn: game.turn,
+    updatedTurn: game.turn,
+    deadlineTurn: quest.timeLimitDays ? game.turn + quest.timeLimitDays : undefined,
+  };
+  let next: GameState = { ...game, questOffers: game.questOffers.filter((offer) => offer.questId !== questId), quests: [...game.quests, progress] };
+  const text = `你接下了“${quest.title}”。${quest.summary}${progress.deadlineTurn !== undefined ? ` 此事需在第 ${progress.deadlineTurn} 天前完成。` : ""}`;
+  next = addLog(next, `接取任务 · ${quest.title}`, text, "mystic", { kind: "quest", locationName: getCurrentLocation(game).name, detail: `阶段 1 / ${quest.stages.length}`, durationDays: 0 });
+  return { ...next, eventResult: { kind: "quest", title: `已接取 · ${quest.title}`, text, tone: "mystic", changes: [], durationDays: 0 } };
+}
+
+function objectiveReady(game: GameState, objective: QuestStageDefinition["objective"]): { allowed: boolean; reason?: string } {
+  if (!objective) return { allowed: true };
+  const location = getCurrentLocation(game);
+  if (objective.type === "visit") {
+    return objective.locationRoles.includes(location.role) ? { allowed: true } : { allowed: false, reason: objective.description };
+  }
+  if (objective.type === "resource") {
+    if (objective.locationRoles?.length && !objective.locationRoles.includes(location.role)) return { allowed: false, reason: `需在指定地点完成：${objective.description}` };
+    return resourceQuantity(game, objective.key) >= objective.amount ? { allowed: true } : { allowed: false, reason: `${objective.description}（当前 ${Math.floor(resourceQuantity(game, objective.key))} / ${objective.amount}）` };
+  }
+  return game.realmStage >= objective.minStage ? { allowed: true } : { allowed: false, reason: objective.description };
+}
+
+export function canAdvanceQuest(game: GameState, questId: string): { allowed: boolean; reason?: string } {
+  if (game.status !== "playing" || hasPendingNarrative(game)) return { allowed: false, reason: "请先处理眼前之事" };
+  const current = getQuestStage(game, questId);
+  if (!current) return { allowed: false, reason: "任务不在进行中" };
+  if (current.progress.deadlineTurn !== undefined && game.turn > current.progress.deadlineTurn) return { allowed: false, reason: "任务已经逾期" };
+  if (current.stage.locationRoles?.length && !current.stage.locationRoles.includes(getCurrentLocation(game).role)) return { allowed: false, reason: "需前往任务指定类型的地点" };
+  return objectiveReady(game, current.stage.objective);
+}
+
+function finalizeQuestFailure(before: GameState, after: GameState, quest: QuestDefinition, progress: QuestProgress, text: string, title: string, durationDays: number): GameState {
+  let next = applyEffects(after, quest.failureEffects ?? []);
+  const failed: QuestProgress = { ...progress, status: "failed", updatedTurn: next.turn, finishedTurn: next.turn, failureReason: text };
+  next = { ...next, pendingQuestId: undefined, quests: next.quests.map((candidate) => candidate.questId === progress.questId && candidate.status === "active" ? failed : candidate) };
+  const changes = eventChanges(before, next);
+  next = addLog(next, `${quest.title} · 失败`, text, "danger", { kind: "quest", locationName: getCurrentLocation(next).name, changes, detail: title, durationDays });
+  return { ...next, eventResult: { kind: "quest", title: `${quest.title} · 失败`, text, tone: "danger", changes, durationDays } };
+}
+
+function finalizeQuestAdvance(before: GameState, after: GameState, quest: QuestDefinition, progress: QuestProgress, text: string, tone: Tone, durationDays: number): GameState {
+  const nextStageIndex = progress.stageIndex + 1;
+  let next = after;
+  if (nextStageIndex >= quest.stages.length) {
+    next = applyEffects(next, quest.completionEffects ?? []);
+    if (quest.completionFlag) next = applyEffects(next, [{ type: "flag", key: quest.completionFlag }]);
+    const completed: QuestProgress = { ...progress, status: "completed", stageIndex: nextStageIndex, updatedTurn: next.turn, finishedTurn: next.turn };
+    next = { ...next, pendingQuestId: undefined, quests: next.quests.map((candidate) => candidate.questId === progress.questId && candidate.status === "active" ? completed : candidate) };
+    const changes = eventChanges(before, next);
+    const completionText = `${text}\n\n“${quest.title}”已经完成，新的因果也由此展开。`;
+    next = addLog(next, `${quest.title} · 完成`, completionText, "good", { kind: "quest", locationName: getCurrentLocation(next).name, changes, detail: "任务完成", durationDays });
+    next = { ...next, eventResult: { kind: "quest", title: `${quest.title} · 完成`, text: completionText, tone: "good", changes, durationDays } };
+    return refreshQuestOffers(next, 1, false);
+  }
+  const updated: QuestProgress = { ...progress, stageIndex: nextStageIndex, updatedTurn: next.turn };
+  next = { ...next, pendingQuestId: undefined, quests: next.quests.map((candidate) => candidate.questId === progress.questId && candidate.status === "active" ? updated : candidate) };
+  const changes = eventChanges(before, next);
+  next = addLog(next, `${quest.title} · ${quest.stages[nextStageIndex].title}`, text, tone, { kind: "quest", locationName: getCurrentLocation(next).name, changes, detail: `阶段 ${nextStageIndex + 1} / ${quest.stages.length}`, durationDays });
+  return { ...next, eventResult: { kind: "quest", title: quest.stages[nextStageIndex].title, text, tone, changes, durationDays } };
+}
+
+export function advanceQuest(game: GameState, questId: string): GameState {
+  if (!canAdvanceQuest(game, questId).allowed) return game;
+  const current = getQuestStage(game, questId)!;
+  if (current.stage.kind === "encounter") return { ...game, pendingQuestId: questId };
+  let next = game;
+  const objective = current.stage.objective;
+  if (objective?.type === "resource" && objective.consume) next = applyEffects(next, [{ type: "resource", key: objective.key, amount: -objective.amount }]);
+  return checkEnding(finalizeQuestAdvance(game, next, current.quest, current.progress, current.stage.body, "mystic", 0));
+}
+
+export function abandonQuest(game: GameState, questId: string): GameState {
+  if (game.status !== "playing" || hasPendingNarrative(game)) return game;
+  const current = getQuestStage(game, questId);
+  if (!current) return game;
+  const abandoned: QuestProgress = { ...current.progress, status: "abandoned", updatedTurn: game.turn, finishedTurn: game.turn, failureReason: "主动放弃" };
+  let next: GameState = { ...game, quests: game.quests.map((candidate) => candidate === current.progress ? abandoned : candidate) };
+  const text = `你放弃了“${current.quest.title}”。线索仍留在世间，但这一次不会再等你。`;
+  next = addLog(next, `${current.quest.title} · 放弃`, text, "neutral", { kind: "quest", locationName: getCurrentLocation(game).name, detail: "主动放弃", durationDays: 0 });
+  return { ...next, eventResult: { kind: "quest", title: `已放弃 · ${current.quest.title}`, text, tone: "neutral", changes: [], durationDays: 0 } };
 }
 
 function summary(reason: RunSummary["reason"], game: GameState): RunSummary {
@@ -881,7 +1431,7 @@ function summary(reason: RunSummary["reason"], game: GameState): RunSummary {
 }
 
 function checkEnding(game: GameState): GameState {
-  if (game.resources.stamina <= 0 || game.resources.age >= game.resources.lifespan) return { ...game, status: "ended", pendingEventId: undefined, summary: summary("fallen", game) };
+  if (game.resources.stamina <= 0 || game.resources.age >= game.resources.lifespan) return { ...game, status: "ended", pendingEventId: undefined, pendingQuestId: undefined, summary: summary("fallen", game) };
   return game;
 }
 
@@ -937,7 +1487,7 @@ export function toggleNpcAttention(game: GameState, npcId: string): GameState {
 }
 
 export function canInteractWithNpc(game: GameState, npcId: string, interactionId: NpcInteractionId): { allowed: boolean; reason?: string } {
-  if (game.status !== "playing" || game.pendingEventId) return { allowed: false, reason: "先处理眼前之事" };
+  if (game.status !== "playing" || hasPendingNarrative(game)) return { allowed: false, reason: "先处理眼前之事" };
   const npc = game.npcs.find((item) => item.id === npcId);
   if (!npc) return { allowed: false, reason: "此人已不在此处" };
   if (!npc.alive) return { allowed: false, reason: "此人已经离世，只能查看其人物档案" };
@@ -1106,7 +1656,7 @@ export function getTravelPath(game: GameState, targetId: string): WorldLocation[
 }
 
 function canTravelLeg(game: GameState, targetId: string): { allowed: boolean; reason?: string } {
-  if (game.status !== "playing" || game.pendingEventId) return { allowed: false, reason: "先处理眼前之事" };
+  if (game.status !== "playing" || hasPendingNarrative(game)) return { allowed: false, reason: "先处理眼前之事" };
   const current = getCurrentLocation(game);
   const target = game.world.locations.find((location) => location.id === targetId);
   if (!target) return { allowed: false, reason: "地图上没有此地" };
@@ -1117,7 +1667,7 @@ function canTravelLeg(game: GameState, targetId: string): { allowed: boolean; re
 }
 
 export function canTravel(game: GameState, targetId: string): { allowed: boolean; reason?: string } {
-  if (game.status !== "playing" || game.pendingEventId) return { allowed: false, reason: "先处理眼前之事" };
+  if (game.status !== "playing" || hasPendingNarrative(game)) return { allowed: false, reason: "先处理眼前之事" };
   const current = getCurrentLocation(game);
   const target = game.world.locations.find((location) => location.id === targetId);
   if (!target) return { allowed: false, reason: "地图上没有此地" };
@@ -1159,7 +1709,7 @@ function travelSteps(game: GameState, steps: string[], generated?: AiGeneratedOu
   for (let index = 0; index < steps.length; index += 1) {
     next = finishTravelLeg(next, steps[index], index === 0 ? generated : undefined);
     const remaining = steps.slice(index + 1);
-    if (next.status !== "playing" || next.pendingEventId) {
+    if (next.status !== "playing" || hasPendingNarrative(next)) {
       return remaining.length && next.status === "playing" ? { ...next, travelPlan: remaining } : { ...next, travelPlan: undefined };
     }
   }
@@ -1197,8 +1747,65 @@ function adjustedOutcomeWeights(game: GameState, choice: EventChoice): number[] 
   });
 }
 
+function chooseQuestOutcome(game: GameState, choice: QuestChoice): [QuestChoice["outcomes"][number], number] {
+  const weights = adjustedOutcomeWeights(game, choice);
+  const total = weights.reduce((sum, weight) => sum + weight, 0);
+  let roll; let rng; [roll, rng] = nextRandom(game.rngState);
+  let cursor = roll * total;
+  let index = 0;
+  for (let i = 0; i < weights.length; i += 1) {
+    cursor -= weights[i];
+    if (cursor <= 0) { index = i; break; }
+  }
+  return [choice.outcomes[index], rng];
+}
+
+function resolveQuestStageInternal(game: GameState, choiceId: string, generated?: AiGeneratedOutcome): GameState {
+  const current = getCurrentQuestStage(game);
+  const choice = current?.stage.choices?.find((candidate) => candidate.id === choiceId);
+  const continueWithoutChoice = choiceId === "__continue__" && !current?.stage.choices?.length;
+  if (!current || current.stage.kind !== "encounter" || (!choice && !continueWithoutChoice) || (choice && !requirementMet(game, choice.requirement))) return game;
+  let localOutcome: QuestChoice["outcomes"][number];
+  let rngState = game.rngState;
+  if (choice) {
+    [localOutcome, rngState] = chooseQuestOutcome(game, choice);
+  } else {
+    localOutcome = { weight: 1, text: current.stage.body, tone: "mystic", result: "advance", effects: [] };
+  }
+  const durationDays = Math.max(1, Math.round(current.stage.durationDays ?? 1));
+  let next = tick({ ...game, rngState, pendingQuestId: undefined }, durationDays);
+  const afterClock = next.quests.find((progress) => progress.questId === current.quest.id && progress.status === "active");
+  if (!afterClock) {
+    const text = `你赶到关键处时，任务期限已经过去。“${current.quest.title}”没能继续。`;
+    const changes = eventChanges(game, next);
+    return { ...next, eventResult: { kind: "quest", title: `${current.quest.title} · 已逾期`, text, tone: "danger", changes, durationDays } };
+  }
+  const outcome = generated
+    ? { ...localOutcome, text: generated.text, tone: generated.tone, effects: generated.effects }
+    : localOutcome;
+  next = applyEffects(next, outcome.effects);
+  const result = localOutcome.result ?? "advance";
+  if (result === "fail") return checkEnding(finalizeQuestFailure(game, next, current.quest, afterClock, outcome.text, current.stage.title, durationDays));
+  if (result === "stay") {
+    const stayed: QuestProgress = { ...afterClock, updatedTurn: next.turn };
+    next = { ...next, quests: next.quests.map((progress) => progress.questId === stayed.questId && progress.status === "active" ? stayed : progress) };
+    const changes = eventChanges(game, next);
+    next = addLog(next, `${current.quest.title} · 受阻`, outcome.text, outcome.tone ?? "neutral", { kind: "quest", locationName: getCurrentLocation(next).name, changes, detail: `仍处于阶段 ${afterClock.stageIndex + 1}`, durationDays });
+    return checkEnding({ ...next, eventResult: { kind: "quest", title: current.stage.title, text: outcome.text, tone: outcome.tone ?? "neutral", changes, durationDays } });
+  }
+  return checkEnding(finalizeQuestAdvance(game, next, current.quest, afterClock, outcome.text, outcome.tone ?? "neutral", durationDays));
+}
+
+export function resolveQuestStage(game: GameState, choiceId: string): GameState {
+  return resolveQuestStageInternal(game, choiceId);
+}
+
+export function resolveQuestStageWithAi(game: GameState, choiceId: string, generated: AiGeneratedOutcome): GameState {
+  return resolveQuestStageInternal(game, choiceId, generated);
+}
+
 function resolveEventInternal(game: GameState, choiceId: string, generated?: AiGeneratedOutcome): GameState {
-  const event = game.pendingEventId ? eventMap.get(game.pendingEventId) : undefined;
+  const event = game.pendingEventId ? eventDefinitionFor(game, game.pendingEventId) : undefined;
   const choice = event?.choices.find((item) => item.id === choiceId);
   if (!event || (event.choices.length > 0 && (!choice || !canChoose(game, choice)))) return game;
 
@@ -1270,7 +1877,7 @@ export function getBreakthroughInfo(game: GameState, usePill: boolean) {
 }
 
 export function canBreakthrough(game: GameState): boolean {
-  return game.status === "playing" && game.realmStage < REALMS.length && !game.pendingEventId && actionAvailable(getCurrentLocation(game), "cultivate") && game.resources.cultivation >= game.resources.cultivationRequired;
+  return game.status === "playing" && game.realmStage < REALMS.length && !hasPendingNarrative(game) && actionAvailable(getCurrentLocation(game), "cultivate") && game.resources.cultivation >= game.resources.cultivationRequired;
 }
 
 export function breakthrough(game: GameState, usePill: boolean): GameState {
@@ -1309,7 +1916,7 @@ export function breakthrough(game: GameState, usePill: boolean): GameState {
     next = addLog(next, "破境成功", breakthroughText, "mystic", { kind: "action", locationName: getCurrentLocation(game).name, changes: eventChanges(game, next), detail: `从${oldRealm}突破至${REALMS[next.realmStage - 1]}`, durationDays: 1 });
     next = withResult(game, next, "破境成功", breakthroughText, "mystic", "action", 1);
     if (next.realmStage >= REALMS.length) {
-      next = { ...next, status: "ended", pendingEventId: undefined };
+      next = { ...next, status: "ended", pendingEventId: undefined, pendingQuestId: undefined };
       return { ...next, summary: summary("ascension", next) };
     }
   } else {
@@ -1332,6 +1939,7 @@ export function claimLegacy(game: GameState, meta: MetaProgress): { game: GameSt
       ...meta,
       totalInsight: meta.totalInsight + game.summary.insightEarned,
       completedRuns: meta.completedRuns + 1,
+      simulationLevel: Math.max(meta.simulationLevel ?? 1, meta.completedRuns + 2),
       victories: meta.victories + (game.summary.reason === "ascension" || game.summary.reason === "foundation" ? 1 : 0),
       discoveredEvents: discovered,
       bestScore: Math.max(meta.bestScore, game.summary.score),
@@ -1340,13 +1948,13 @@ export function claimLegacy(game: GameState, meta: MetaProgress): { game: GameSt
 }
 
 export function getCurrentEvent(game: GameState): EventDefinition | undefined {
-  return game.pendingEventId ? eventMap.get(game.pendingEventId) : undefined;
+  return game.pendingEventId ? eventDefinitionFor(game, game.pendingEventId) : undefined;
 }
 
 export function dismissEventResult(game: GameState): GameState {
   if (!game.eventResult) return game;
   const cleared = { ...game, eventResult: undefined };
-  if (cleared.travelPlan?.length && cleared.status === "playing" && !cleared.pendingEventId) {
+  if (cleared.travelPlan?.length && cleared.status === "playing" && !hasPendingNarrative(cleared)) {
     return travelSteps(cleared, cleared.travelPlan);
   }
   return cleared;
