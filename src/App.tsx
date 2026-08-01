@@ -1141,7 +1141,9 @@ function GameScreen({ game, meta, theme, onThemeChange, aiSettings, onAiSettings
     return generateContent(baseGame, trigger, false);
   };
   const generateEventContent = async (baseGame: GameState, trigger: AiQuestGenerationTrigger): Promise<GameState> => {
-    if (!aiSettings.enabled || aiSettings.questGeneration !== "continuous" || baseGame.status !== "playing") return baseGame;
+    // Event content generation is probability-driven and should also work in
+    // manual world-generation mode; "off" remains the explicit opt-out.
+    if (!aiSettings.enabled || aiSettings.questGeneration === "off" || baseGame.status !== "playing") return baseGame;
     const rolled = rollAiContentChance(baseGame);
     if (!rolled.shouldGenerate) return rolled.game;
     return generateContent(rolled.game, trigger, false);
