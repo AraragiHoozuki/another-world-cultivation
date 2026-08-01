@@ -3,6 +3,12 @@ import { loadEnv } from "vite";
 import react from "@vitejs/plugin-react";
 import type { Plugin } from "vite";
 
+type RuntimeEnv = { VITE_BASE?: string };
+
+function runtimeEnv(): RuntimeEnv {
+  return (globalThis as typeof globalThis & { process?: { env?: RuntimeEnv } }).process?.env ?? {};
+}
+
 type ProxyRequest = {
   url?: string;
   method?: string;
@@ -72,7 +78,7 @@ function aiProxyPlugin(): Plugin {
 }
 
 export default defineConfig(({ mode }) => ({
-  base: loadEnv(mode, ".", "").VITE_BASE || "/",
+  base: runtimeEnv().VITE_BASE || loadEnv(mode, ".", "VITE_").VITE_BASE || "/",
   plugins: [react(), aiProxyPlugin()],
   test: {
     environment: "jsdom",
