@@ -31,6 +31,7 @@ import {
   Menu,
   Mountain,
   PackageOpen,
+  Plus,
   RefreshCw,
   Route,
   ScrollText,
@@ -43,6 +44,7 @@ import {
   Moon,
   Sun,
   Target,
+  Trash2,
   Trees,
   UserRound,
   Users,
@@ -59,6 +61,7 @@ import {
   requestAiAction,
   requestAiContent,
   requestAiEvent,
+  requestAiLifeResume,
   requestAiNpcInteraction,
   requestAiQuest,
   requestAiStartingTraits,
@@ -119,8 +122,8 @@ import {
   sellItem,
   useItem,
 } from "./game/engine";
-import { exportSave, importSave, loadAiSettings, loadGame, loadMeta, saveAiSettings, saveGame, saveMeta } from "./game/storage";
-import type { ActionDefinition, ActionId, AiQuestGenerationTrigger, AiSettings, CharacterCandidate, CharacterGender, ChronicleEntry, EventResult, GameState, ItemCategory, ItemDefinition, MetaProgress, Npc, NpcInteractionId, NpcRelationshipType, QuestChoice, QuestDefinition, QuestProgress, QuestStageDefinition, ResourceKey, Tone, TraitDefinition, WorldLocation, WorldOptions } from "./game/types";
+import { DEFAULT_AI_PROFILE, DEFAULT_AI_SETTINGS, exportSave, importSave, loadAiProfiles, loadGame, loadMeta, saveAiProfiles, saveGame, saveMeta } from "./game/storage";
+import type { ActionDefinition, ActionId, AiProfile, AiProfileStore, AiQuestGenerationTrigger, AiSettings, CharacterCandidate, CharacterGender, ChronicleEntry, EventResult, GameState, ItemCategory, ItemDefinition, LifeArchive, MetaProgress, Npc, NpcInteractionId, NpcRelationshipType, QuestChoice, QuestDefinition, QuestProgress, QuestStageDefinition, ResourceKey, Tone, TraitDefinition, WorldLocation, WorldOptions } from "./game/types";
 
 type Screen = "welcome" | "create" | "game";
 type MobileTab = "journey" | "map" | "npcs" | "quests" | "inventory" | "character" | "actions" | "legacy";
@@ -232,11 +235,11 @@ function ProgressBar({ value, max, tone = "jade", label }: { value: number; max:
   );
 }
 
-function WelcomeScreen({ game, meta, onContinue, onCreate, onManage }: { game: GameState | null; meta: MetaProgress; onContinue: () => void; onCreate: () => void; onManage: () => void }) {
+function WelcomeScreen({ game, meta, onContinue, onCreate, onManage, onArchives }: { game: GameState | null; meta: MetaProgress; onContinue: () => void; onCreate: () => void; onManage: () => void; onArchives: () => void }) {
   return (
     <main className="welcome-screen">
       <div className="welcome-backdrop" aria-hidden="true" />
-      <header className="welcome-header"><Brand /><IconButton label="设置与存档" icon={Settings} onClick={onManage} /></header>
+      <header className="welcome-header"><Brand /><div className="welcome-header-tools"><IconButton label="书卷存档" icon={BookOpen} onClick={onArchives} /><IconButton label="设置与存档" icon={Settings} onClick={onManage} /></div></header>
       <section className="welcome-content">
         <div className="title-seal">界蚀将至</div>
         <h1>异界问道</h1>
@@ -244,11 +247,70 @@ function WelcomeScreen({ game, meta, onContinue, onCreate, onManage }: { game: G
         <div className="welcome-actions">
           {game && <button className="primary-command" type="button" onClick={onContinue}><ScrollText size={19} /><span>续写此生</span><ChevronRight size={18} /></button>}
           <button className={game ? "secondary-command" : "primary-command"} type="button" onClick={onCreate}><Sparkles size={18} /><span>另启轮回</span></button>
+          {(meta.archives?.length ?? 0) > 0 && <button className="secondary-command welcome-archive-command" type="button" onClick={onArchives}><BookOpen size={18} /><span>翻阅书卷 · {meta.archives?.length}</span></button>}
         </div>
         <div className="legacy-line"><History size={15} /><span>轮回见闻 {meta.totalInsight}</span><i /><span>模拟等级 Lv.{meta.simulationLevel ?? meta.completedRuns + 1}</span><i /><span>已历 {meta.completedRuns} 世</span></div>
       </section>
       <p className="welcome-quote">“此界不问来处，只问你能走多远。”</p>
     </main>
+  );
+}
+
+function archiveGenderLabel(gender: LifeArchive["character"]["gender"]): string {
+  return gender === "male" ? "男性" : gender === "female" ? "女性" : "性别未定";
+}
+
+function ArchiveDialog({ meta, aiSettings, onMetaChange, onClose }: { meta: MetaProgress; aiSettings: AiSettings; onMetaChange: (meta: MetaProgress) => void; onClose: () => void }) {
+  const archives = meta.archives ?? [];
+  const [selectedId, setSelectedId] = useState<string | undefined>(archives[archives.length - 1]?.id);
+  const [resumeBusy, setResumeBusy] = useState(false);
+  const [resumeError, setResumeError] = useState("");
+  const selected = archives.find((archive) => archive.id === selectedId) ?? archives[0];
+  useEffect(() => {
+    if (!selected || !archives.some((archive) => archive.id === selected.id)) setSelectedId(archives[archives.length - 1]?.id);
+  }, [archives, selected]);
+  const generateResume = async () => {
+    if (!selected || resumeBusy) return;
+    setResumeError("");
+    if (!isAiConfigured(aiSettings)) {
+      setResumeError("请先在设置中开启 AI，并填写 API 地址、Key 和模型。");
+      return;
+    }
+    setResumeBusy(true);
+    try {
+      const resume = await requestAiLifeResume(aiSettings, selected);
+      const generatedAt = new Date().toISOString();
+      onMetaChange({ ...meta, archives: archives.map((archive) => archive.id === selected.id ? { ...archive, resume, resumeGeneratedAt: generatedAt } : archive) });
+    } catch (error) {
+      setResumeError(error instanceof Error ? error.message : "人生简历生成失败");
+    } finally {
+      setResumeBusy(false);
+    }
+  };
+  return (
+    <div className="modal-backdrop archive-backdrop" role="presentation" onMouseDown={(event) => { if (event.target === event.currentTarget) onClose(); }}>
+      <section className="dialog archive-dialog" role="dialog" aria-modal="true" aria-labelledby="archive-title">
+        <header><div><span className="eyebrow">山门书阁 · 已终卷宗</span><h2 id="archive-title">书卷存档</h2></div><IconButton label="关闭书卷存档" icon={X} onClick={onClose} /></header>
+        {archives.length === 0 ? (
+          <div className="archive-empty"><BookOpen size={34} /><strong>尚无已完成的人生</strong><p>当一世因飞升、寿终或其他结局结束后，完整历程会自动收入这里。</p></div>
+        ) : (
+          <div className="archive-layout">
+            <aside className="archive-list" aria-label="人生卷宗列表">
+              <div className="archive-list-heading"><span>卷宗</span><b>{archives.length} 卷</b></div>
+              {archives.slice().reverse().map((archive, index) => <button key={archive.id} type="button" className={selected?.id === archive.id ? "selected" : ""} onClick={() => { setSelectedId(archive.id); setResumeError(""); }}><span className="archive-list-index">卷 {archives.length - index}</span><span className="archive-list-copy"><b>{archive.character.name}</b><small>{archive.summary.title} · {archive.finalRealm}</small><small>第 {archive.turn} 天 · {formatYears(archive.age)} 岁</small></span><ChevronRight size={15} /></button>)}
+            </aside>
+            {selected && <article className="archive-detail">
+              <div className="archive-detail-heading"><div><span className="eyebrow">第 {archives.findIndex((archive) => archive.id === selected.id) + 1} 卷 · {selected.summary.title}</span><h3>{selected.character.name}</h3><p>{archiveGenderLabel(selected.character.gender)} · {selected.character.origin} · {selected.character.spiritRoot} · {selected.character.talent}</p></div><span className={`archive-ending archive-ending-${selected.summary.reason}`}>{selected.finalRealm}</span></div>
+              <div className="archive-character-meta"><span>根骨 <b>{selected.character.stats.constitution}</b></span><span>悟性 <b>{selected.character.stats.insight}</b></span><span>神识 <b>{selected.character.stats.spirit}</b></span><span>气运 <b>{selected.character.stats.fortune}</b></span>{selected.character.traits.length > 0 && <div className="archive-traits"><small>初始命格</small>{selected.character.traits.map((trait) => <b key={trait.id} className={`trait-text-${trait.rarity}`}>{trait.name}</b>)}</div>}</div>
+              <div className="archive-facts"><span><b>行年</b>{selected.turn} 天</span><span><b>年龄</b>{formatYears(selected.age)} 岁</span><span><b>寿元</b>{formatYears(selected.lifespan)} 年</span><span><b>评分</b>{selected.summary.score}</span><span><b>见闻</b>+{selected.summary.insightEarned}</span></div>
+              <p className="archive-epitaph">{selected.summary.epitaph}</p>
+              <div className="archive-resume-section"><div className="archive-section-heading"><span><ScrollText size={15} />人生简历</span>{selected.resumeGeneratedAt && <small>已生成 · {new Date(selected.resumeGeneratedAt).toLocaleDateString("zh-CN")}</small>}</div>{selected.resume ? <p className="archive-resume">{selected.resume}</p> : <div className="archive-resume-empty"><p>尚未为这卷人生撰写简历。</p><button className="secondary-command" type="button" disabled={resumeBusy} onClick={() => void generateResume()}><Sparkles size={16} className={resumeBusy ? "spin" : ""} />{resumeBusy ? "AI 正在撰写…" : "AI 生成人生简历"}</button></div>}{selected.resume && <button className="text-button archive-regenerate" type="button" disabled={resumeBusy} onClick={() => void generateResume()}><RefreshCw size={15} className={resumeBusy ? "spin" : ""} />{resumeBusy ? "重新撰写中…" : "重新生成简历"}</button>}{resumeError && <p className="archive-error" role="status">{resumeError}</p>}</div>
+              <div className="archive-chronicle-section"><div className="archive-section-heading"><span><History size={15} />一生经历</span><small>{selected.chronicle.length} 条记录</small></div><ol className="archive-chronicle">{selected.chronicle.slice().reverse().map((entry, index) => <li key={`${entry.id}-${index}`} className={`tone-${entry.tone}`}><div className="archive-chronicle-marker"><span>{entry.turn}</span></div><div className="archive-chronicle-copy"><strong>{entry.title}</strong><small>{entry.locationName ?? "未知地点"}{entry.durationDays ? ` · ${entry.durationDays} 天` : ""}</small><p>{entry.text}</p>{entry.changes && entry.changes.length > 0 && <div className="archive-change-list">{entry.changes.map((change, changeIndex) => <span key={`${change.label}-${changeIndex}`}>{change.label} {change.amount > 0 ? `+${change.amount}` : change.amount}</span>)}</div>}</div></li>)}</ol></div>
+            </article>}
+          </div>
+        )}
+      </section>
+    </div>
   );
 }
 
@@ -1014,14 +1076,21 @@ function EndScreen({ game, meta, onReincarnate, onHome }: { game: GameState; met
   );
 }
 
-function SaveDialog({ game, meta, theme, onThemeChange, aiSettings, onAiSettingsChange, onClose, onImport, onNew }: { game: GameState | null; meta: MetaProgress; theme: ThemeMode; onThemeChange: (theme: ThemeMode) => void; aiSettings: AiSettings; onAiSettingsChange: (settings: AiSettings) => void; onClose: () => void; onImport: (game: GameState | null, meta: MetaProgress) => void; onNew: () => void }) {
+function SaveDialog({ game, meta, theme, onThemeChange, aiSettings, aiProfiles, activeAiProfileId, onAiProfileStateChange, onClose, onImport, onNew }: { game: GameState | null; meta: MetaProgress; theme: ThemeMode; onThemeChange: (theme: ThemeMode) => void; aiSettings: AiSettings; aiProfiles: AiProfile[]; activeAiProfileId: string; onAiProfileStateChange: (profiles: AiProfile[], activeProfileId: string) => void; onClose: () => void; onImport: (game: GameState | null, meta: MetaProgress) => void; onNew: () => void }) {
   const fileRef = useRef<HTMLInputElement>(null);
   const [message, setMessage] = useState("");
   const [draftAi, setDraftAi] = useState<AiSettings>(aiSettings);
+  const [draftProfileName, setDraftProfileName] = useState("");
   const [models, setModels] = useState<string[]>([]);
   const [modelMessage, setModelMessage] = useState("");
   const [loadingModels, setLoadingModels] = useState(false);
-  useEffect(() => setDraftAi(aiSettings), [aiSettings]);
+  const activeProfile = aiProfiles.find((profile) => profile.id === activeAiProfileId) ?? aiProfiles[0];
+  useEffect(() => {
+    setDraftAi(aiSettings);
+    setDraftProfileName(activeProfile?.name ?? DEFAULT_AI_PROFILE.name);
+    setModels([]);
+    setModelMessage("");
+  }, [aiSettings, activeAiProfileId]);
   const download = () => {
     const blob = new Blob([exportSave(game, meta)], { type: "application/json" });
     const url = URL.createObjectURL(blob);
@@ -1035,11 +1104,43 @@ function SaveDialog({ game, meta, theme, onThemeChange, aiSettings, onAiSettings
     catch (error) { setMessage(error instanceof Error ? error.message : "存档读取失败"); }
   };
   const updateAi = <K extends keyof AiSettings>(key: K, value: AiSettings[K]) => setDraftAi((current) => ({ ...current, [key]: value }));
+  const switchProfile = (profileId: string) => {
+    const target = aiProfiles.find((profile) => profile.id === profileId);
+    if (!target || profileId === activeAiProfileId) return;
+    onAiProfileStateChange(aiProfiles, profileId);
+    setMessage(`已切换到 AI 档案“${target.name}”`);
+  };
+  const createProfile = () => {
+    const requestedName = window.prompt("请输入新的 AI 配置档案名称", `配置 ${aiProfiles.length + 1}`);
+    if (requestedName === null) return;
+    const name = requestedName.trim().slice(0, 32) || `配置 ${aiProfiles.length + 1}`;
+    const id = `profile-${Date.now().toString(36)}-${Math.random().toString(36).slice(2, 7)}`;
+    const profile: AiProfile = { ...DEFAULT_AI_PROFILE, id, name };
+    onAiProfileStateChange([...aiProfiles, profile], id);
+    setMessage(`已新建 AI 档案“${name}”`);
+  };
+  const deleteProfile = () => {
+    if (aiProfiles.length <= 1) {
+      setMessage("至少需要保留一个 AI 配置档案");
+      return;
+    }
+    if (!activeProfile || !window.confirm(`确定删除 AI 档案“${activeProfile.name}”吗？`)) return;
+    const remaining = aiProfiles.filter((profile) => profile.id !== activeProfile.id);
+    const nextActive = remaining[0];
+    onAiProfileStateChange(remaining, nextActive.id);
+    setMessage(`已删除 AI 档案“${activeProfile.name}”`);
+  };
   const saveAi = () => {
     const next = { ...draftAi, endpoint: draftAi.endpoint.trim(), apiKey: draftAi.apiKey.trim(), model: draftAi.model.trim() };
-    onAiSettingsChange(next);
+    const name = draftProfileName.trim().slice(0, 32) || activeProfile?.name || DEFAULT_AI_PROFILE.name;
+    const profile: AiProfile = { ...(activeProfile ?? DEFAULT_AI_PROFILE), ...next, id: activeProfile?.id ?? activeAiProfileId, name };
+    const profiles = aiProfiles.some((candidate) => candidate.id === profile.id)
+      ? aiProfiles.map((candidate) => candidate.id === profile.id ? profile : candidate)
+      : [...aiProfiles, profile];
+    onAiProfileStateChange(profiles, profile.id);
     setDraftAi(next);
-    setMessage("AI 设置已保存");
+    setDraftProfileName(name);
+    setMessage(`AI 档案“${name}”已保存`);
   };
   const loadModels = async () => {
     setLoadingModels(true);
@@ -1069,6 +1170,11 @@ function SaveDialog({ game, meta, theme, onThemeChange, aiSettings, onAiSettings
             <button type="button" className={theme === "light" ? "selected" : ""} aria-pressed={theme === "light"} onClick={() => onThemeChange("light")}><Sun size={18} /><span><b>浅色主题</b><small>清晰明亮，适合白天</small></span></button>
             <button type="button" className={theme === "dark" ? "selected" : ""} aria-pressed={theme === "dark"} onClick={() => onThemeChange("dark")}><Moon size={18} /><span><b>深色主题</b><small>沉浸安静，适合夜间</small></span></button>
           </div>
+        </section>
+        <section className="ai-profile-section" aria-labelledby="ai-profile-title">
+          <div className="ai-profile-heading"><div><span className="eyebrow">连接档案</span><h3 id="ai-profile-title">AI 配置档案</h3></div><span className="ai-profile-count">{aiProfiles.length} 个档案</span></div>
+          <div className="ai-profile-picker"><select aria-label="AI 配置档案" value={activeAiProfileId} onChange={(event) => switchProfile(event.target.value)}>{aiProfiles.map((profile) => <option key={profile.id} value={profile.id}>{profile.name}</option>)}</select><button className="secondary-command" type="button" onClick={createProfile}><Plus size={15} />新建</button><button className="danger-command ai-profile-delete" type="button" disabled={aiProfiles.length <= 1} onClick={deleteProfile}><Trash2 size={15} />删除</button></div>
+          <label className="setting-field ai-profile-name-field"><span>档案名称</span><input value={draftProfileName} maxLength={32} onChange={(event) => setDraftProfileName(event.target.value)} placeholder="例如：本地长文模型" /></label>
         </section>
         <section className="ai-settings-section" aria-labelledby="ai-settings-title">
           <header className="ai-settings-heading"><div><span className="eyebrow">可选叙事引擎</span><h3 id="ai-settings-title"><Bot size={17} />AI 模式</h3></div><label className="ai-toggle"><input type="checkbox" checked={draftAi.enabled} onChange={(event) => updateAi("enabled", event.target.checked)} /><span>{draftAi.enabled ? "已开启" : "已关闭"}</span></label></header>
@@ -1415,31 +1521,54 @@ function GameScreen({ game, meta, theme, onThemeChange, aiSettings, onAiSettings
 export default function App() {
   const [game, setGame] = useState<GameState | null>(() => loadGame());
   const [meta, setMeta] = useState<MetaProgress>(() => loadMeta());
-  const [aiSettings, setAiSettings] = useState<AiSettings>(() => loadAiSettings());
+  const [aiProfileState, setAiProfileState] = useState<AiProfileStore>(() => loadAiProfiles());
   const [theme, setTheme] = useState<ThemeMode>(() => loadTheme());
   const [screen, setScreen] = useState<Screen>(() => loadGame() ? "welcome" : "create");
   const [saveOpen, setSaveOpen] = useState(false);
+  const [archiveOpen, setArchiveOpen] = useState(false);
+  const activeAiProfile = aiProfileState.profiles.find((profile) => profile.id === aiProfileState.activeProfileId) ?? aiProfileState.profiles[0];
+  const aiSettings: AiSettings = activeAiProfile ?? DEFAULT_AI_SETTINGS;
+  const updateCurrentAiSettings = (next: AiSettings) => {
+    setAiProfileState((current) => {
+      const activeId = current.activeProfileId || current.profiles[0]?.id || DEFAULT_AI_PROFILE.id;
+      const profiles = current.profiles.length ? current.profiles : [{ ...DEFAULT_AI_PROFILE }];
+      return { profiles: profiles.map((profile) => profile.id === activeId ? { ...profile, ...next } : profile), activeProfileId: activeId };
+    });
+  };
+  const updateAiProfileState = (profiles: AiProfile[], activeProfileId: string) => {
+    const safeProfiles = profiles.length ? profiles : [{ ...DEFAULT_AI_PROFILE }];
+    const safeActiveProfileId = safeProfiles.some((profile) => profile.id === activeProfileId) ? activeProfileId : safeProfiles[0].id;
+    setAiProfileState({ profiles: safeProfiles, activeProfileId: safeActiveProfileId });
+  };
   useEffect(() => { saveGame(game); }, [game]);
   useEffect(() => { saveMeta(meta); }, [meta]);
-  useEffect(() => { saveAiSettings(aiSettings); }, [aiSettings]);
+  useEffect(() => { saveAiProfiles(aiProfileState.profiles, aiProfileState.activeProfileId); }, [aiProfileState]);
+  useEffect(() => {
+    if (!game || game.status !== "ended" || game.legacyClaimed) return;
+    const claimed = claimLegacy(game, meta);
+    setGame(claimed.game);
+    setMeta(claimed.meta);
+  }, [game, meta]);
   useEffect(() => {
     document.documentElement.dataset.theme = theme;
     document.documentElement.style.colorScheme = theme;
     try { window.localStorage.setItem(THEME_STORAGE_KEY, theme); } catch { /* storage may be unavailable in private browsing */ }
   }, [theme]);
   const begin = (candidate: CharacterCandidate, name: string, seed: number, worldOptions: WorldOptions, gender: CharacterGender, traits: TraitDefinition[]) => { setGame(startGame(candidate, name, seed, worldOptions, gender, traits)); setScreen("game"); };
-  const newRun = () => { setGame(null); setScreen("create"); setSaveOpen(false); };
+  const newRun = () => { setGame(null); setScreen("create"); setSaveOpen(false); setArchiveOpen(false); };
   const importAll = (importedGame: GameState | null, importedMeta: MetaProgress) => { setGame(importedGame); setMeta(importedMeta); setScreen(importedGame ? "game" : "create"); setSaveOpen(false); };
   const openCreation = () => {
     if (game?.status === "playing" && !window.confirm("当前一世尚未终结。确定暂别此世，重新选择命格？")) return;
+    setArchiveOpen(false);
     setScreen("create");
   };
   return (
     <div className="app" data-theme={theme}>
-      {screen === "welcome" && <WelcomeScreen game={game} meta={meta} onContinue={() => setScreen("game")} onCreate={openCreation} onManage={() => setSaveOpen(true)} />}
+      {screen === "welcome" && <WelcomeScreen game={game} meta={meta} onContinue={() => setScreen("game")} onCreate={openCreation} onManage={() => setSaveOpen(true)} onArchives={() => setArchiveOpen(true)} />}
       {screen === "create" && <CreationScreen meta={meta} aiSettings={aiSettings} onBack={() => setScreen("welcome")} onStart={begin} />}
-      {screen === "game" && game && <GameScreen game={game} meta={meta} theme={theme} onThemeChange={setTheme} aiSettings={aiSettings} onAiSettingsChange={setAiSettings} onGame={setGame} onMeta={setMeta} onHome={() => setScreen("welcome")} onReincarnate={newRun} onManage={() => setSaveOpen(true)} />}
-      {saveOpen && <SaveDialog game={game} meta={meta} theme={theme} onThemeChange={setTheme} aiSettings={aiSettings} onAiSettingsChange={setAiSettings} onClose={() => setSaveOpen(false)} onImport={importAll} onNew={newRun} />}
+      {screen === "game" && game && <GameScreen game={game} meta={meta} theme={theme} onThemeChange={setTheme} aiSettings={aiSettings} onAiSettingsChange={updateCurrentAiSettings} onGame={setGame} onMeta={setMeta} onHome={() => setScreen("welcome")} onReincarnate={newRun} onManage={() => setSaveOpen(true)} />}
+      {saveOpen && <SaveDialog game={game} meta={meta} theme={theme} onThemeChange={setTheme} aiSettings={aiSettings} aiProfiles={aiProfileState.profiles} activeAiProfileId={aiProfileState.activeProfileId} onAiProfileStateChange={updateAiProfileState} onClose={() => setSaveOpen(false)} onImport={importAll} onNew={newRun} />}
+      {archiveOpen && <ArchiveDialog meta={meta} aiSettings={aiSettings} onMetaChange={setMeta} onClose={() => setArchiveOpen(false)} />}
     </div>
   );
 }

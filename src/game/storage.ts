@@ -12,7 +12,7 @@ import {
   qiCapacityForStage,
 } from "./engine";
 import { REALMS, itemMap, traitMap } from "./data";
-import type { AiProviderFormat, AiSettings, CoreStats, GameState, MetaProgress, Npc, Resources, SaveEnvelope, TraitDefinition, TraitRarity } from "./types";
+import type { AiProfile, AiProfileStore, AiProviderFormat, AiSettings, CoreStats, GameState, LifeArchive, MetaProgress, Npc, Resources, SaveEnvelope, TraitDefinition, TraitRarity } from "./types";
 
 const GAME_KEY = "another-world.game.v1";
 const META_KEY = "another-world.meta.v1";
@@ -25,6 +25,12 @@ export const DEFAULT_AI_SETTINGS: AiSettings = {
   format: "openai",
   model: "gpt-4o-mini",
   questGeneration: "manual",
+};
+
+export const DEFAULT_AI_PROFILE: AiProfile = {
+  id: "default",
+  name: "默认配置",
+  ...DEFAULT_AI_SETTINGS,
 };
 
 function isGameState(value: unknown): value is GameState {
@@ -42,7 +48,26 @@ function isMeta(value: unknown): value is MetaProgress {
 function normalizeMeta(meta: MetaProgress): MetaProgress {
   const completedRuns = typeof meta.completedRuns === "number" && Number.isFinite(meta.completedRuns) ? Math.max(0, Math.floor(meta.completedRuns)) : 0;
   const storedLevel = typeof meta.simulationLevel === "number" && Number.isFinite(meta.simulationLevel) ? Math.floor(meta.simulationLevel) : 1;
-  return { ...meta, completedRuns, simulationLevel: Math.max(1, storedLevel, completedRuns + 1) };
+  const archives = Array.isArray(meta.archives)
+    ? meta.archives.flatMap((raw): LifeArchive[] => {
+      if (!raw || typeof raw !== "object") return [];
+      const archive = raw as Partial<LifeArchive>;
+      if (typeof archive.id !== "string" || typeof archive.createdAt !== "string" || !archive.character || typeof archive.character !== "object" || !archive.summary || typeof archive.summary !== "object") return [];
+      if (!Array.isArray(archive.chronicle)) return [];
+      return [{
+        ...archive,
+        id: archive.id.slice(0, 120),
+        chronicle: archive.chronicle.filter((entry) => entry && typeof entry === "object").map((entry) => ({ ...entry })),
+        character: {
+          ...archive.character,
+          traits: Array.isArray(archive.character.traits) ? archive.character.traits : [],
+          stats: archive.character.stats ?? { constitution: 1, insight: 1, spirit: 1, fortune: 1 },
+        },
+        summary: { ...archive.summary },
+      } as LifeArchive];
+    })
+    : [];
+  return { ...meta, completedRuns, archives, simulationLevel: Math.max(1, storedLevel, completedRuns + 1) };
 }
 
 function isAiSettings(value: unknown): value is AiSettings {
@@ -54,6 +79,24 @@ function isAiSettings(value: unknown): value is AiSettings {
     && (candidate.format === "openai" || candidate.format === "claude")
     && typeof candidate.model === "string"
     && (candidate.questGeneration === undefined || candidate.questGeneration === "off" || candidate.questGeneration === "manual" || candidate.questGeneration === "continuous");
+}
+
+function normalizeAiProfile(value: unknown, fallbackId: string, fallbackName: string): AiProfile | undefined {
+  if (!isAiSettings(value)) return undefined;
+  const source = value as Partial<AiProfile>;
+  const id = typeof source.id === "string" && source.id.trim() ? source.id.trim().slice(0, 80) : fallbackId;
+  const name = typeof source.name === "string" && source.name.trim() ? source.name.trim().slice(0, 32) : fallbackName;
+  return {
+    ...DEFAULT_AI_SETTINGS,
+    ...source,
+    id,
+    name,
+    questGeneration: source.questGeneration ?? DEFAULT_AI_SETTINGS.questGeneration,
+  };
+}
+
+function defaultAiProfileStore(): AiProfileStore {
+  return { profiles: [{ ...DEFAULT_AI_PROFILE }], activeProfileId: DEFAULT_AI_PROFILE.id };
 }
 
 const TRAIT_RARITIES: TraitRarity[] = ["gray", "white", "green", "blue", "purple", "rainbow"];
@@ -264,17 +307,58 @@ export function saveMeta(meta: MetaProgress): void {
   localStorage.setItem(META_KEY, JSON.stringify(meta));
 }
 
-export function loadAiSettings(): AiSettings {
+export function loadAiProfiles(): AiProfileStore {
   try {
     const value = localStorage.getItem(AI_KEY);
-    if (!value) return { ...DEFAULT_AI_SETTINGS };
+    if (!value) return defaultAiProfileStore();
     const parsed: unknown = JSON.parse(value);
-    return isAiSettings(parsed) ? { ...DEFAULT_AI_SETTINGS, ...parsed } : { ...DEFAULT_AI_SETTINGS };
-  } catch { return { ...DEFAULT_AI_SETTINGS }; }
+    // Migrate the original single-settings object into the first named profile.
+    if (isAiSettings(parsed)) {
+      const migrated = normalizeAiProfile(parsed, DEFAULT_AI_PROFILE.id, DEFAULT_AI_PROFILE.name) ?? { ...DEFAULT_AI_PROFILE };
+      return { profiles: [migrated], activeProfileId: migrated.id };
+    }
+    if (!parsed || typeof parsed !== "object") return defaultAiProfileStore();
+    const source = parsed as Partial<AiProfileStore>;
+    if (!Array.isArray(source.profiles)) return defaultAiProfileStore();
+    const usedIds = new Set<string>();
+    const profiles = source.profiles.flatMap((profile, index) => {
+      const fallbackId = index === 0 ? DEFAULT_AI_PROFILE.id : `profile-${index + 1}`;
+      const normalized = normalizeAiProfile(profile, fallbackId, `配置 ${index + 1}`);
+      if (!normalized || usedIds.has(normalized.id)) return [];
+      usedIds.add(normalized.id);
+      return [normalized];
+    });
+    if (!profiles.length) return defaultAiProfileStore();
+    const requestedActive = typeof source.activeProfileId === "string" ? source.activeProfileId : profiles[0].id;
+    return { profiles, activeProfileId: profiles.some((profile) => profile.id === requestedActive) ? requestedActive : profiles[0].id };
+  } catch { return defaultAiProfileStore(); }
+}
+
+export function saveAiProfiles(profiles: AiProfile[], activeProfileId: string): void {
+  const validProfiles = profiles.length ? profiles : [{ ...DEFAULT_AI_PROFILE }];
+  const active = validProfiles.some((profile) => profile.id === activeProfileId) ? activeProfileId : validProfiles[0].id;
+  localStorage.setItem(AI_KEY, JSON.stringify({ profiles: validProfiles, activeProfileId: active }));
+}
+
+/** Compatibility helpers for callers that only need the currently selected profile. */
+export function loadAiSettings(): AiSettings {
+  const state = loadAiProfiles();
+  const active = state.profiles.find((profile) => profile.id === state.activeProfileId) ?? state.profiles[0];
+  return active ? {
+    enabled: active.enabled,
+    endpoint: active.endpoint,
+    apiKey: active.apiKey,
+    format: active.format,
+    model: active.model,
+    questGeneration: active.questGeneration,
+  } : { ...DEFAULT_AI_SETTINGS };
 }
 
 export function saveAiSettings(settings: AiSettings): void {
-  localStorage.setItem(AI_KEY, JSON.stringify(settings));
+  const state = loadAiProfiles();
+  const activeId = state.activeProfileId || state.profiles[0]?.id || DEFAULT_AI_PROFILE.id;
+  const profiles = state.profiles.map((profile) => profile.id === activeId ? { ...profile, ...settings } : profile);
+  saveAiProfiles(profiles, activeId);
 }
 
 export function exportSave(game: GameState | null, meta: MetaProgress): string {

@@ -16,6 +16,7 @@ import type {
   EventResultChange,
   GameState,
   InventoryEntry,
+  LifeArchive,
   ItemDefinition,
   LocationRole,
   LocationModifiers,
@@ -112,6 +113,7 @@ export const emptyMeta = (): MetaProgress => ({
   victories: 0,
   discoveredEvents: [],
   bestScore: 0,
+  archives: [],
 });
 
 export interface SimulationProgression {
@@ -1946,12 +1948,42 @@ export function breakthrough(game: GameState, usePill: boolean): GameState {
 }
 
 export function claimLegacy(game: GameState, meta: MetaProgress): { game: GameState; meta: MetaProgress } {
-  if (!game.summary || game.legacyClaimed) return { game, meta };
+  if (!game.summary) return { game, meta };
+  const archiveId = `life-${game.seed}-${game.turn}-${game.summary.reason}`;
+  const previousArchives = Array.isArray(meta.archives) ? meta.archives : [];
+  if (previousArchives.some((entry) => entry.id === archiveId)) return { game, meta };
+  const archive: LifeArchive = {
+    id: archiveId,
+    createdAt: new Date().toISOString(),
+    seed: game.seed,
+    character: {
+      name: game.character.name,
+      gender: game.character.gender,
+      origin: game.character.origin.name,
+      spiritRoot: game.character.spiritRoot.name,
+      talent: game.character.talent.name,
+      stats: { ...game.character.stats },
+      traits: (game.character.traits ?? []).map((trait) => ({ ...trait, stats: trait.stats ? { ...trait.stats } : undefined, resources: trait.resources ? { ...trait.resources } : undefined })),
+    },
+    summary: { ...game.summary },
+    realmStage: game.realmStage,
+    finalRealm: REALMS[game.realmStage - 1] ?? "羽化飞升",
+    turn: game.turn,
+    age: game.resources.age,
+    lifespan: game.resources.lifespan,
+    finalLocationName: game.world.locations.find((location) => location.id === game.world.currentLocationId)?.name,
+    chronicle: game.chronicle.map((entry) => ({ ...entry, changes: entry.changes?.map((change) => ({ ...change })) })),
+  };
+  const archives = [...previousArchives, archive];
+  // A legacy save may already have claimed meta rewards before archive volumes
+  // existed. Add the volume without awarding those rewards a second time.
+  if (game.legacyClaimed) return { game, meta: { ...meta, archives } };
   const discovered = Array.from(new Set([...meta.discoveredEvents, ...Object.keys(game.seenEvents)]));
   return {
     game: { ...game, legacyClaimed: true },
     meta: {
       ...meta,
+      archives,
       totalInsight: meta.totalInsight + game.summary.insightEarned,
       completedRuns: meta.completedRuns + 1,
       simulationLevel: Math.max(meta.simulationLevel ?? 1, meta.completedRuns + 2),

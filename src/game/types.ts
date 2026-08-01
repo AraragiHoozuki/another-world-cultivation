@@ -35,6 +35,17 @@ export interface AiSettings {
   questGeneration: AiQuestGenerationMode;
 }
 
+/** A named, switchable set of AI connection and generation settings. */
+export interface AiProfile extends AiSettings {
+  id: string;
+  name: string;
+}
+
+export interface AiProfileStore {
+  profiles: AiProfile[];
+  activeProfileId: string;
+}
+
 export interface AiGeneratedOutcome {
   title?: string;
   text: string;
@@ -458,6 +469,33 @@ export interface RunSummary {
   insightEarned: number;
 }
 
+/** A compact, immutable record of a completed simulation. */
+export interface LifeArchive {
+  id: string;
+  createdAt: string;
+  seed: number;
+  character: {
+    name: string;
+    gender: CharacterGender;
+    origin: string;
+    spiritRoot: string;
+    talent: string;
+    stats: CoreStats;
+    traits: TraitDefinition[];
+  };
+  summary: RunSummary;
+  realmStage: number;
+  finalRealm: string;
+  turn: number;
+  age: number;
+  lifespan: number;
+  finalLocationName?: string;
+  chronicle: ChronicleEntry[];
+  /** AI-generated life resume, retained in this volume for later reading. */
+  resume?: string;
+  resumeGeneratedAt?: string;
+}
+
 export interface GameState {
   version: 1;
   seed: number;
@@ -503,6 +541,8 @@ export interface MetaProgress {
   victories: number;
   discoveredEvents: string[];
   bestScore: number;
+  /** Completed lives, oldest first. Older saves may omit this field. */
+  archives?: LifeArchive[];
 }
 
 export interface SaveEnvelope {

@@ -19,6 +19,7 @@ import type {
   ItemCategory,
   ItemDefinition,
   ItemRarity,
+  LifeArchive,
   LocationRole,
   LocationModifiers,
   Npc,
@@ -111,6 +112,10 @@ const CONTENT_SYSTEM_PROMPT = `你是《异界问道》的世界编剧与系统�
   "quests": [{ "id": "英文短标识", "title": "任务标题", "summary": "任务摘要", "offerText": "接取时文案", "offerRoles": ["地点类型"], "timeLimitDays": 30, "stages": [{ "id": "英文短标识", "title": "阶段标题", "body": "阶段文案", "kind": "condition | encounter", "locationRoles": ["地点类型"], "objective": { "type": "visit | resource | realm", "description": "目标说明", "locationRoles": ["地点类型"], "key": "资源名", "amount": 3, "minStage": 1 }, "durationDays": 1, "choices": [{ "id": "英文短标识", "label": "选项", "hint": "提示", "outcomes": [{ "weight": 1, "result": "advance | stay | fail", "text": "结果文案", "tone": "neutral | good | danger | mystic", "effects": [效果] }] }] }], "completionFlag": "英文标识", "completionEffects": [效果], "failureEffects": [效果] }]
 }
 允许一次生成 1 至 3 条互相衔接的任务、1 至 3 个地点、物品、事件和 NPC。可以使用反转、长期因果、灰色选择和高风险奖励，但所有 id、资源、属性、地点类型、行动类型必须使用允许值；不要生成无法在当前世界完成的地点要求。任务链后续任务应通过 requireFlag 连接前一任务的 completionFlag。效果中的 resource key 只能是 health、stamina、lifespan、age、battlePower、qi、mind、cultivation、spiritStones、herbs、pills；stat key 只能是 constitution、insight、spirit、fortune。`;
+
+const LIFE_RESUME_SYSTEM_PROMPT = `你是《异界问道》的卷宗撰写人。请根据一位修士已经结束的一生，写一份有文学感但清晰克制的人生简历。
+内容需要包含：人物来历与性格印象、修行境界与关键转折、值得记住的人和事、最终结局，以及一句像墓志铭或卷末批语的总结。
+只输出纯中文文本，不要 JSON、Markdown 标题、代码围栏、免责声明或解释；分成 4 至 7 个自然段，总长度控制在 500 至 1100 字。不要凭空添加档案中没有的确定事实，可以用含蓄的文学表达补足气氛。`;
 
 export function isAiConfigured(settings: AiSettings): boolean {
   return settings.enabled && Boolean(settings.apiKey.trim()) && Boolean(settings.model.trim()) && Boolean(settings.endpoint.trim() || DEFAULT_ENDPOINTS[settings.format]);
@@ -967,6 +972,49 @@ export async function requestAiNpcInteraction(settings: AiSettings, game: GameSt
 
 export async function requestAiTravel(settings: AiSettings, game: GameState, target: { id: string; name: string; subtitle: string; description: string; danger: string; travelCost: number }): Promise<AiGeneratedOutcome> {
   return requestOutcome(settings, travelPayload(game, target));
+}
+
+export async function requestAiLifeResume(settings: AiSettings, archive: LifeArchive): Promise<string> {
+  if (!isAiConfigured(settings)) throw new Error("请先在设置中启用并完整配置 AI");
+  const payload = {
+    task: "为已结束的人生撰写卷宗简历",
+    character: archive.character,
+    summary: archive.summary,
+    finalRealm: archive.finalRealm,
+    turn: archive.turn,
+    age: archive.age,
+    lifespan: archive.lifespan,
+    finalLocationName: archive.finalLocationName,
+    chronicle: archive.chronicle.slice().reverse().map((entry) => ({
+      day: entry.turn,
+      title: entry.title,
+      text: entry.text,
+      kind: entry.kind,
+      detail: entry.detail,
+      locationName: entry.locationName,
+      changes: entry.changes,
+    })),
+  };
+  const body = settings.format === "claude"
+    ? {
+      model: modelName(settings),
+      max_tokens: 3200,
+      temperature: 0.85,
+      stream: false,
+      system: LIFE_RESUME_SYSTEM_PROMPT,
+      messages: [{ role: "user", content: JSON.stringify(payload) }],
+    }
+    : {
+      model: modelName(settings),
+      max_tokens: 3200,
+      temperature: 0.85,
+      stream: false,
+      messages: [{ role: "system", content: LIFE_RESUME_SYSTEM_PROMPT }, { role: "user", content: JSON.stringify(payload) }],
+    };
+  const response = await requestJson(completionEndpoint(settings), { method: "POST", headers: headers(settings), body: JSON.stringify(body) }, 180_000);
+  const content = responseText(response).trim();
+  if (!content) throw new Error("AI 响应中没有可解析的人生简历");
+  return content.replace(/^```(?:text|markdown)?\s*/i, "").replace(/\s*```$/i, "").trim().slice(0, 5000);
 }
 
 function modelIds(value: unknown): string[] {
