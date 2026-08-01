@@ -500,7 +500,21 @@ export function startGame(candidate: CharacterCandidate, name: string, seed: num
 }
 
 function hasPendingNarrative(game: GameState): boolean {
-  return Boolean(game.pendingEventId || game.pendingQuestId);
+  return Boolean(game.pendingEventId || game.pendingQuestId || game.pendingEventQueue?.length);
+}
+
+function queuePendingEvent(game: GameState, eventId: string): GameState {
+  if (!eventId) return game;
+  if (!game.pendingEventId) return { ...game, pendingEventId: eventId };
+  const queue = game.pendingEventQueue ?? [];
+  if (game.pendingEventId === eventId || queue.includes(eventId)) return game;
+  return { ...game, pendingEventQueue: [...queue, eventId] };
+}
+
+function promotePendingEvent(game: GameState): GameState {
+  if (game.pendingEventId || !game.pendingEventQueue?.length) return game;
+  const [pendingEventId, ...remaining] = game.pendingEventQueue;
+  return { ...game, pendingEventId, pendingEventQueue: remaining.length ? remaining : undefined };
 }
 
 function itemDefinitions(game: GameState): ItemDefinition[] {
@@ -1000,7 +1014,7 @@ function finishAction(game: GameState, actionId: ActionId, durationDays: number,
     if (eventRoll < eventChance) {
       let eventId; [eventId, next.rngState] = selectEvent(next, actionId);
       if (eventId) {
-        next.pendingEventId = eventId;
+        next = queuePendingEvent(next, eventId);
         next.seenEvents = { ...next.seenEvents, [eventId]: (next.seenEvents[eventId] ?? 0) + 1 };
       }
     }
@@ -1431,7 +1445,7 @@ function summary(reason: RunSummary["reason"], game: GameState): RunSummary {
 }
 
 function checkEnding(game: GameState): GameState {
-  if (game.resources.stamina <= 0 || game.resources.age >= game.resources.lifespan) return { ...game, status: "ended", pendingEventId: undefined, pendingQuestId: undefined, summary: summary("fallen", game) };
+  if (game.resources.stamina <= 0 || game.resources.age >= game.resources.lifespan) return { ...game, status: "ended", pendingEventId: undefined, pendingEventQueue: undefined, pendingQuestId: undefined, summary: summary("fallen", game) };
   return game;
 }
 
@@ -1696,7 +1710,7 @@ function finishTravelLeg(game: GameState, targetId: string, generated?: AiGenera
   if (eventRoll < eventChance) {
     let eventId; [eventId, next.rngState] = selectEvent(next, "travel");
     if (eventId) {
-      next.pendingEventId = eventId;
+      next = queuePendingEvent(next, eventId);
       next.seenEvents = { ...next.seenEvents, [eventId]: (next.seenEvents[eventId] ?? 0) + 1 };
     }
   }
@@ -1830,6 +1844,7 @@ function resolveEventInternal(game: GameState, choiceId: string, generated?: AiG
 
   const durationDays = Math.max(1, Math.round(event.durationDays ?? 1));
   let next = tick({ ...game, rngState: rng, pendingEventId: undefined }, durationDays);
+  next = promotePendingEvent(next);
   next = applyEffects(next, outcome.effects);
   if (choice && isCombatChoice(choice) && outcome.tone === "danger") {
     const mitigation = Math.min(0.55, Math.max(0, (game.resources.battlePower - 30) * 0.01));
@@ -1916,7 +1931,7 @@ export function breakthrough(game: GameState, usePill: boolean): GameState {
     next = addLog(next, "破境成功", breakthroughText, "mystic", { kind: "action", locationName: getCurrentLocation(game).name, changes: eventChanges(game, next), detail: `从${oldRealm}突破至${REALMS[next.realmStage - 1]}`, durationDays: 1 });
     next = withResult(game, next, "破境成功", breakthroughText, "mystic", "action", 1);
     if (next.realmStage >= REALMS.length) {
-      next = { ...next, status: "ended", pendingEventId: undefined, pendingQuestId: undefined };
+      next = { ...next, status: "ended", pendingEventId: undefined, pendingEventQueue: undefined, pendingQuestId: undefined };
       return { ...next, summary: summary("ascension", next) };
     }
   } else {
@@ -1953,7 +1968,7 @@ export function getCurrentEvent(game: GameState): EventDefinition | undefined {
 
 export function dismissEventResult(game: GameState): GameState {
   if (!game.eventResult) return game;
-  const cleared = { ...game, eventResult: undefined };
+  const cleared = promotePendingEvent({ ...game, eventResult: undefined });
   if (cleared.travelPlan?.length && cleared.status === "playing" && !hasPendingNarrative(cleared)) {
     return travelSteps(cleared, cleared.travelPlan);
   }

@@ -474,6 +474,8 @@ export interface GameState {
   flags: string[];
   seenEvents: Record<string, number>;
   pendingEventId?: string;
+  /** Events triggered while another event is awaiting resolution. */
+  pendingEventQueue?: string[];
   questOffers: QuestOffer[];
   quests: QuestProgress[];
   /** AI-authored quest definitions retained with this life/save. */

@@ -222,12 +222,18 @@ function normalizeGame(game: GameState): GameState {
   const travelPlan = Array.isArray(game.travelPlan)
     ? game.travelPlan.filter((id): id is string => typeof id === "string" && world.locations.some((location) => location.id === id))
     : undefined;
+  const pendingEventQueue = Array.isArray(game.pendingEventQueue)
+    ? Array.from(new Set(game.pendingEventQueue.filter((id): id is string => typeof id === "string" && id.length > 0)))
+    : [];
+  const pendingEventId = typeof game.pendingEventId === "string" && game.pendingEventId.length > 0
+    ? game.pendingEventId
+    : pendingEventQueue.shift();
   const questOffers = Array.isArray((game as Partial<GameState>).questOffers) ? game.questOffers : [];
   const quests = Array.isArray((game as Partial<GameState>).quests) ? game.quests : [];
   const generatedQuests = Array.isArray((game as Partial<GameState>).generatedQuests) ? game.generatedQuests : [];
   const generatedEvents = Array.isArray((game as Partial<GameState>).generatedEvents) ? game.generatedEvents : [];
   const generatedItems = Array.isArray((game as Partial<GameState>).generatedItems) ? game.generatedItems : [];
-  const normalized = { ...game, character, resources: normalizedResources, world, npcs, inventory: normalizedInventory, travelPlan: travelPlan?.length ? travelPlan : undefined, questOffers, quests, generatedQuests, generatedEvents, generatedItems } as GameState;
+  const normalized = { ...game, character, resources: normalizedResources, world, npcs, inventory: normalizedInventory, pendingEventId, pendingEventQueue: pendingEventQueue.length ? pendingEventQueue : undefined, travelPlan: travelPlan?.length ? travelPlan : undefined, questOffers, quests, generatedQuests, generatedEvents, generatedItems } as GameState;
   return initializeQuestSystem(normalized);
 }
 
