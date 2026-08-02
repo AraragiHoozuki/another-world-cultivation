@@ -1,12 +1,16 @@
 import { getCurrentLocation } from "./engine";
-import { EVENTS, NPC_IDENTITIES, QUESTS } from "./data";
+import { EVENTS, ITEMS, NPC_IDENTITIES, QUESTS } from "./data";
 import type {
   ActionDefinition,
   ActionId,
   AiGeneratedContentBundle,
+  AiEventRewrite,
+  AiExploreResult,
   AiGeneratedLocationDraft,
   AiGeneratedOutcome,
+  AiQuestStageRewrite,
   AiQuestGenerationTrigger,
+  AiResultRewrite,
   AiSettings,
   CharacterCandidate,
   CoreStat,
@@ -14,6 +18,7 @@ import type {
   Effect,
   EventChoice,
   EventDefinition,
+  EventResult,
   EventTrigger,
   GameState,
   ItemCategory,
@@ -26,6 +31,7 @@ import type {
   NpcIdentity,
   NpcInteractionDefinition,
   NpcGender,
+  NarrativeMessage,
   QuestObjective,
   QuestChoice,
   QuestDefinition,
@@ -84,7 +90,18 @@ const TRAIT_SYSTEM_PROMPT = `你是《异界问道》的开局命格设计师。
 const NPC_GENDERS: NpcGender[] = ["male", "female", "unknown"];
 const NPC_IDENTITY_IDS: NpcIdentity[] = NPC_IDENTITIES.map((identity) => identity.id);
 
+const STORY_STYLE_GUIDE = `文风要像一部好看的中文网络小说：具体、自然、有画面，人物说话像活人，不要堆砌“玄之又玄、道韵流转”一类空泛古雅词。长短句交替，叙述、动作、对话穿插，避免每次都用同一种三段式或“只见……随后……”的句式。允许一点幽默、迟疑、误会和不体面的细节，让结果有现场感，但不要喧宾夺主。`;
+const EFFECT_PROTOCOL_GUIDE = `effects 可混合使用以下效果：
+- 资源：{ "type": "resource", "key": "health | stamina | lifespan | age | battlePower | qi | mind | cultivation | spiritStones | herbs | pills", "amount": 数字 }
+- 基础属性：{ "type": "stat", "key": "constitution | insight | spirit | fortune", "amount": -3至3整数 }
+- 物品：{ "type": "item", "itemId": "context.availableItems 中已有的 id，或本次 worldContent 新物品 id", "amount": 整数 }
+- 永久词条：{ "type": "trait", "trait": { "id": "英文短标识", "name": "词条名", "description": "身份、状态或经历及其具体作用", "rarity": "gray | white | green | blue | purple | rainbow", "cost": 0, "stats": {}, "resources": {}, "cultivationBonus": 0, "alchemyBonus": 0, "explorationBonus": 0, "dangerModifier": 0 } }
+- 临时词条：与永久词条相同，但在外层增加 "durationDays": 1至3650。
+- 标记：{ "type": "flag", "key": "英文短标识" }。
+词条应与故事产生的身份、伤势、感悟、名声或契约直接相关，稀有且有意义；不要每次都发词条，不要用词条重复普通资源变化。`;
+
 const SYSTEM_PROMPT = `你是《异界问道》的叙事裁定者。根据给定的游戏上下文，裁定一次行动、强制事件或主动任务阶段的结果。
+${STORY_STYLE_GUIDE}
 只输出一个合法 JSON 对象，不要 Markdown、代码围栏、解释或额外文字。JSON 必须符合：
 {
   "title": "不超过 24 个汉字的结果标题",
@@ -99,9 +116,10 @@ const SYSTEM_PROMPT = `你是《异界问道》的叙事裁定者。根据给定
   ]
 }
 resource key 只能是 health、stamina、lifespan、age、battlePower、qi、mind、cultivation、spiritStones、herbs、pills；stat key 只能是 constitution、insight、spirit、fortune。
-效果应符合行动成本、角色能力和世界危险程度；不要修改未提及的属性，不要伪造天数。NPC 互动和行途的固定资源消耗已由程序自动应用，effects 不要重复填写这些消耗。主动任务的阶段推进、失败和完成由程序根据本地判定决定，你只负责当前阶段的文案与合理属性变化，不要跳过后续阶段。所有数值都是相对变化量。`;
+效果应符合行动成本、角色能力和世界危险程度；不要修改未提及的属性，不要伪造天数。NPC 互动和行途的固定资源消耗已由程序自动应用，effects 不要重复填写这些消耗。主动任务的阶段推进、失败和完成由程序根据本地判定决定，你只负责当前阶段的文案与合理属性变化，不要跳过后续阶段。effects 还可包含物品与词条：物品使用 { "type": "item", "itemId": "当前世界已有物品 id", "amount": 1 }；永久词条使用 { "type": "trait", "trait": { "id": "英文短标识", "name": "词条名", "description": "身份、经历或能力说明", "rarity": "gray | white | green | blue | purple | rainbow", "cost": 0, "stats": {}, "resources": {}, "cultivationBonus": 0, "alchemyBonus": 0, "explorationBonus": 0, "dangerModifier": 0 } }；临时词条额外填写 "durationDays": 1至3650。词条应当少见且与剧情强相关，不要在每次结果中强行发放。所有数值都是相对变化量。若 payload 的 allowDerivativeContent 为 true，可额外返回 worldContent（结构与世界内容生成相同），只在确有剧情依据时返回少量新地点、人物、任务、事件或物品；否则省略。`;
 
 const CONTENT_SYSTEM_PROMPT = `你是《异界问道》的世界编剧与系统设计师。你可以大胆创作全新的异界剧情、地点、主动任务链、强制事件、物品和 NPC，让每一轮人生都可能走向不同的故事。
+${STORY_STYLE_GUIDE}
 只输出一个合法 JSON 对象，不要 Markdown、代码围栏、解释或额外文字。顶层格式：
 {
   "narrative": "可选的本次世界异动短文案",
@@ -111,14 +129,78 @@ const CONTENT_SYSTEM_PROMPT = `你是《异界问道》的世界编剧与系统�
   "events": [{ "id": "英文短标识", "title": "事件标题", "body": "事件正文", "actions": ["cultivate | explore | gather | alchemy | market | rest | travel"], "locationRoles": ["地点类型"], "durationDays": 1, "outcomes": [{ "weight": 1, "text": "无选项时的结果文案", "tone": "neutral | good | danger | mystic", "effects": [效果] }], "choices": [{ "id": "英文短标识", "label": "选项", "hint": "提示", "requirement": {}, "outcomes": [{ "weight": 1, "text": "结果文案", "tone": "neutral | good | danger | mystic", "effects": [效果] }] }] }],
   "quests": [{ "id": "英文短标识", "title": "任务标题", "summary": "任务摘要", "offerText": "接取时文案", "offerRoles": ["地点类型"], "timeLimitDays": 30, "stages": [{ "id": "英文短标识", "title": "阶段标题", "body": "阶段文案", "kind": "condition | encounter", "locationRoles": ["地点类型"], "objective": { "type": "visit | resource | realm", "description": "目标说明", "locationRoles": ["地点类型"], "key": "资源名", "amount": 3, "minStage": 1 }, "durationDays": 1, "choices": [{ "id": "英文短标识", "label": "选项", "hint": "提示", "outcomes": [{ "weight": 1, "result": "advance | stay | fail", "text": "结果文案", "tone": "neutral | good | danger | mystic", "effects": [效果] }] }] }], "completionFlag": "英文标识", "completionEffects": [效果], "failureEffects": [效果] }]
 }
-允许一次生成 1 至 3 条互相衔接的任务、1 至 3 个地点、物品、事件和 NPC。可以使用反转、长期因果、灰色选择和高风险奖励，但所有 id、资源、属性、地点类型、行动类型必须使用允许值；不要生成无法在当前世界完成的地点要求。任务链后续任务应通过 requireFlag 连接前一任务的 completionFlag。效果中的 resource key 只能是 health、stamina、lifespan、age、battlePower、qi、mind、cultivation、spiritStones、herbs、pills；stat key 只能是 constitution、insight、spirit、fortune。`;
+允许一次生成 1 至 3 条互相衔接的任务、1 至 3 个地点、物品、事件和 NPC。可以使用反转、长期因果、灰色选择和高风险奖励，但所有 id、资源、属性、地点类型、行动类型必须使用允许值；不要生成无法在当前世界完成的地点要求。任务链后续任务应通过 requireFlag 连接前一任务的 completionFlag。效果中的 resource key 只能是 health、stamina、lifespan、age、battlePower、qi、mind、cultivation、spiritStones、herbs、pills；stat key 只能是 constitution、insight、spirit、fortune。事件和任务奖励也可使用 item 与 trait 效果；itemId 必须引用已有物品或本次 worldContent 新生成物品的 id，trait 格式与普通裁定协议一致，可用 durationDays 表示临时词条。`;
+
+const EVENT_REWRITE_SYSTEM_PROMPT = `你是《异界问道》的现场叙事导演。玩家正在面对一个已经发生的事件，请在不违背当前世界状态的前提下，重写这一刻的正文和可选行动，让它像一段正在发生的小说场景：具体、有动作、有人的反应，句式有变化，偶尔可以有幽默、迟疑或不体面的细节。不要故作高深，不要只堆砌古雅词，也不要让每次结果都像同一个模板。${STORY_STYLE_GUIDE}
+${EFFECT_PROTOCOL_GUIDE}
+只输出一个合法 JSON 对象，不要 Markdown、代码围栏或额外解释。格式：
+{
+  "event": {
+    "title": "不超过 60 个汉字",
+    "body": "100 至 700 字的事件正文",
+    "actions": ["cultivate | explore | gather | alchemy | market | rest | travel"],
+    "locationRoles": ["地点类型"],
+    "durationDays": 1,
+    "outcomes": [{ "weight": 1, "text": "无选项时的结果", "tone": "neutral | good | danger | mystic", "effects": [] }],
+    "choices": [{ "id": "英文短标识", "label": "选项文字", "hint": "选项提示", "requirement": {}, "outcomes": [{ "weight": 1, "text": "结果文案", "tone": "neutral | good | danger | mystic", "effects": [] }] }]
+  },
+  "followUpEvents": [{ "title": "后续事件标题", "body": "后续事件正文", "actions": ["explore"], "choices": [] }],
+  "narrative": "可选的重构旁白",
+  "worldContent": { "narrative": "可选", "locations": [], "items": [], "npcs": [], "events": [], "quests": [] }
+}
+当前事件的 id、once、触发条件由程序保留；事件选项应根据场景自然地生成 1 至 5 个，不能机械固定数量；followUpEvents 最多 3 个。worldContent 只有在允许时才填写，最多生成少量地点、人物、任务、事件或物品。effects 只能使用协议允许的相对变化量，不要重复程序自动扣除的行动成本。`;
+
+const RESULT_REWRITE_SYSTEM_PROMPT = `你是《异界问道》的现场叙事导演。玩家刚完成一次行动、移动、交往、任务或事件，眼前结果已经结算。请重写当前结果弹窗的叙事，并根据场景自然地给出 1 至 5 个从这一刻继续行动的选项。已经发生的耗时和属性变化不可撤销、不可重复计算；新选项的 effects 只描述选择之后新增的变化，每个选项固定再耗时 1 天。${STORY_STYLE_GUIDE}
+${EFFECT_PROTOCOL_GUIDE}
+只输出一个合法 JSON 对象，不要 Markdown、代码围栏或额外解释。格式：
+{
+  "title": "不超过 60 个汉字",
+  "text": "100 至 700 字的当前场景",
+  "tone": "neutral | good | danger | mystic",
+  "conversation": [{ "speaker": "人物名", "text": "自然的对白", "side": "player | other | narrator" }],
+  "choices": [{ "id": "英文短标识", "label": "选项文字", "hint": "可能的代价或意图", "requirement": {}, "outcomes": [{ "weight": 1, "text": "选择后的下一轮结果", "tone": "neutral | good | danger | mystic", "effects": [] }] }],
+  "followUpEvents": [],
+  "narrative": "可选旁白",
+  "worldContent": { "narrative": "可选", "locations": [], "items": [], "npcs": [], "events": [], "quests": [] }
+}
+followUpEvents 最多 3 个，会在当前分支结束后依次发生。worldContent 只有在允许时才填写。effects 必须是协议允许的相对变化量，不得重放当前结果的变化。`;
+
+const QUEST_STAGE_REWRITE_SYSTEM_PROMPT = `你是《异界问道》的任务叙事导演。玩家正在一个尚未结算的任务阶段中。请只重写当前阶段的标题、正文和 1 至 5 个选择，数量应服从当前场景，不要直接替玩家选择，也不要跳过本地任务进度。每个 outcome 的 result 必须明确为 advance、stay 或 fail。${STORY_STYLE_GUIDE}
+${EFFECT_PROTOCOL_GUIDE}
+只输出一个合法 JSON 对象，不要 Markdown、代码围栏或额外解释。格式：
+{
+  "stage": {
+    "title": "阶段标题",
+    "body": "100 至 700 字的现场叙事",
+    "kind": "encounter",
+    "durationDays": 1,
+    "choices": [{ "id": "英文短标识", "label": "选项文字", "hint": "可能的代价或意图", "requirement": {}, "outcomes": [{ "weight": 1, "result": "advance | stay | fail", "text": "选择后的结果", "tone": "neutral | good | danger | mystic", "effects": [] }] }]
+  },
+  "followUpEvents": [],
+  "narrative": "可选旁白",
+  "worldContent": { "narrative": "可选", "locations": [], "items": [], "npcs": [], "events": [], "quests": [] }
+}
+任务目标、阶段 id 和地点限制由程序保留；followUpEvents 最多 3 个。worldContent 只有在允许时才填写。`;
+
+const EXPLORE_SYSTEM_PROMPT = `你是《异界问道》的探索叙事导演。玩家选择了“探索”，请结合当前人物属性、所在地点、地点上的 NPC 和近期经历，现场写出一次不可预知但合理的遭遇。结果要有小说现场感，叙述、动作和对话交错，长短句变化，不要套用固定三段式，也不要满篇玄虚古雅词。${STORY_STYLE_GUIDE}
+${EFFECT_PROTOCOL_GUIDE}
+只输出一个合法 JSON 对象，不要 Markdown、代码围栏或额外解释。格式：
+{
+  "title": "不超过 24 个汉字的结果标题",
+  "text": "80 至 400 字的结果文案",
+  "tone": "neutral | good | danger | mystic",
+  "effects": [{ "type": "resource | stat | item | trait | status | flag", "key": "协议允许的键", "itemId": "已有物品 id", "amount": 0, "durationDays": 12, "trait": { "id": "英文短标识", "name": "词条名", "description": "具体效果与身份说明", "rarity": "gray | white | green | blue | purple | rainbow", "cost": 0 } }],
+  "conversation": [{ "speaker": "人物名", "text": "一句自然的对话", "side": "player | other | narrator" }],
+  "worldContent": { "narrative": "可选", "locations": [], "items": [], "npcs": [], "events": [], "quests": [] }
+}
+conversation 需要 2 至 8 条，只有确实发生交流时才使用；探索的固定成本由程序自动应用，effects 不要重复扣除。worldContent 只有在允许时才填写。`;
 
 const LIFE_RESUME_SYSTEM_PROMPT = `你是《异界问道》的卷宗撰写人。请根据一位修士已经结束的一生，写一份有文学感但清晰克制的人生简历。
 内容需要包含：人物来历与性格印象、修行境界与关键转折、值得记住的人和事、最终结局，以及一句像墓志铭或卷末批语的总结。
 只输出纯中文文本，不要 JSON、Markdown 标题、代码围栏、免责声明或解释；分成 4 至 7 个自然段，总长度控制在 500 至 1100 字。不要凭空添加档案中没有的确定事实，可以用含蓄的文学表达补足气氛。`;
 
 export function isAiConfigured(settings: AiSettings): boolean {
-  return settings.enabled && Boolean(settings.apiKey.trim()) && Boolean(settings.model.trim()) && Boolean(settings.endpoint.trim() || DEFAULT_ENDPOINTS[settings.format]);
+  return Boolean(settings.apiKey.trim()) && Boolean(settings.model.trim()) && Boolean(settings.endpoint.trim() || DEFAULT_ENDPOINTS[settings.format]);
 }
 
 function completionEndpoint(settings: AiSettings): string {
@@ -175,16 +257,49 @@ function responseText(response: unknown): string {
   return choiceText || jsonText(candidate.content) || jsonText(candidate.output_text) || jsonText(candidate.output) || jsonText(candidate.text);
 }
 
+function hasGameChoices(value: unknown): boolean {
+  return Array.isArray(value) && value.some((choice) => {
+    if (!choice || typeof choice !== "object") return false;
+    const candidate = choice as Record<string, unknown>;
+    return typeof candidate.label === "string" && Array.isArray(candidate.outcomes);
+  });
+}
+
+function isDirectResultRewriteResponse(response: unknown): response is Record<string, unknown> {
+  if (!response || typeof response !== "object") return false;
+  const candidate = response as Record<string, unknown>;
+  return typeof candidate.text === "string" && hasGameChoices(candidate.choices);
+}
+
+function isDirectQuestStageRewriteResponse(response: unknown): response is Record<string, unknown> {
+  if (!response || typeof response !== "object") return false;
+  const candidate = response as Record<string, unknown>;
+  if (candidate.stage && typeof candidate.stage === "object") return true;
+  return typeof candidate.body === "string" && hasGameChoices(candidate.choices);
+}
+
 function isContentBundle(value: unknown): value is Record<string, unknown> {
   if (!value || typeof value !== "object") return false;
   const candidate = value as Record<string, unknown>;
   return ["locations", "items", "npcs", "events", "quests"].some((key) => Array.isArray(candidate[key]));
 }
 
-const DEFAULT_REQUEST_TIMEOUT = 45_000;
+function hasContentEntries(value: unknown): value is Record<string, unknown> {
+  if (!isContentBundle(value)) return false;
+  return ["locations", "items", "npcs", "events", "quests"].some((key) => Array.isArray(value[key]) && value[key].length > 0);
+}
+
+const DEFAULT_REQUEST_TIMEOUT = 180_000;
 const CONTENT_REQUEST_TIMEOUT = 300_000;
 const TRAIT_REQUEST_TIMEOUT = 120_000;
 const CONTENT_MAX_TOKENS = 16_000;
+const OUTCOME_MAX_TOKENS = 3_200;
+const EVENT_REWRITE_TIMEOUT = 180_000;
+const EVENT_REWRITE_MAX_TOKENS = 6_000;
+const DIALOG_REWRITE_TIMEOUT = 180_000;
+const DIALOG_REWRITE_MAX_TOKENS = 6_000;
+const EXPLORE_TIMEOUT = 180_000;
+const EXPLORE_MAX_TOKENS = 6_500;
 
 function parseResponseBody(body: string): unknown {
   const normalized = body.trim().replace(/^\uFEFF/, "");
@@ -287,6 +402,7 @@ function contextFor(game: GameState): Record<string, unknown> {
     },
     resources: game.resources,
     inventory: game.inventory,
+    availableItems: [...ITEMS, ...(game.generatedItems ?? [])].map((item) => ({ id: item.id, name: item.name, category: item.category, rarity: item.rarity })),
     statuses: game.statuses,
     flags: game.flags,
     world: {
@@ -414,6 +530,38 @@ function boundedNumber(value: unknown, min: number, max: number, integer = false
   return integer ? Math.round(result) : result;
 }
 
+function sanitizeEffectTrait(value: unknown, fallbackId: string): TraitDefinition | undefined {
+  if (!value || typeof value !== "object") return undefined;
+  const source = value as Record<string, unknown>;
+  if (typeof source.name !== "string" || typeof source.description !== "string") return undefined;
+  const rarity = TRAIT_RARITIES.includes(source.rarity as TraitRarity) ? source.rarity as TraitRarity : "white";
+  const stats = source.stats && typeof source.stats === "object"
+    ? Object.fromEntries(STAT_KEYS.flatMap((key) => {
+      const amount = boundedNumber((source.stats as Record<string, unknown>)[key], -3, 3, true);
+      return amount === undefined || amount === 0 ? [] : [[key, amount]];
+    })) as Partial<CoreStats>
+    : undefined;
+  const resources = source.resources && typeof source.resources === "object"
+    ? Object.fromEntries(TRAIT_RESOURCE_KEYS.flatMap((key) => {
+      const amount = boundedNumber((source.resources as Record<string, unknown>)[key], -300, 500, true);
+      return amount === undefined || amount === 0 ? [] : [[key, amount]];
+    })) as Partial<Resources>
+    : undefined;
+  return {
+    id: safeIdentifier(source.id, fallbackId),
+    name: source.name.trim().slice(0, 36),
+    description: source.description.trim().slice(0, 180),
+    rarity,
+    cost: 0,
+    ...(stats && Object.keys(stats).length ? { stats } : {}),
+    ...(resources && Object.keys(resources).length ? { resources } : {}),
+    cultivationBonus: boundedNumber(source.cultivationBonus, -0.5, 0.8),
+    alchemyBonus: boundedNumber(source.alchemyBonus, -0.5, 0.8),
+    explorationBonus: boundedNumber(source.explorationBonus, -0.5, 0.8),
+    dangerModifier: boundedNumber(source.dangerModifier, -0.5, 0.5),
+  };
+}
+
 function sanitizeEffect(value: unknown): Effect | undefined {
   if (!value || typeof value !== "object") return undefined;
   const candidate = value as Record<string, unknown>;
@@ -424,6 +572,16 @@ function sanitizeEffect(value: unknown): Effect | undefined {
   if (candidate.type === "stat" && typeof candidate.key === "string" && STAT_KEYS.includes(candidate.key as CoreStat)) {
     const amount = boundedNumber(candidate.amount, -3, 3, true);
     return amount === undefined ? undefined : { type: "stat", key: candidate.key as CoreStat, amount };
+  }
+  if (candidate.type === "item" && typeof candidate.itemId === "string") {
+    const amount = boundedNumber(candidate.amount, -99, 99, true);
+    return amount === undefined || amount === 0 ? undefined : { type: "item", itemId: candidate.itemId.slice(0, 96), amount };
+  }
+  if (candidate.type === "trait") {
+    const trait = sanitizeEffectTrait(candidate.trait, `event-trait-${Date.now().toString(36)}`);
+    if (!trait) return undefined;
+    const durationDays = boundedNumber(candidate.durationDays, 1, 3650, true);
+    return { type: "trait", trait, ...(durationDays === undefined ? {} : { durationDays }) };
   }
   if (candidate.type === "flag" && typeof candidate.key === "string" && /^[\w-]{1,40}$/.test(candidate.key)) return { type: "flag", key: candidate.key };
   if (candidate.type === "status" && candidate.status && typeof candidate.status === "object") {
@@ -438,6 +596,8 @@ function sanitizeEffect(value: unknown): Effect | undefined {
       }))
       : undefined;
     const cultivationBonus = boundedNumber(status.cultivationBonus, -0.8, 1.5);
+    const alchemyBonus = boundedNumber(status.alchemyBonus, -0.8, 1.5);
+    const explorationBonus = boundedNumber(status.explorationBonus, -0.8, 1.5);
     const dangerModifier = boundedNumber(status.dangerModifier, -0.8, 0.8);
     return {
       type: "status",
@@ -446,8 +606,11 @@ function sanitizeEffect(value: unknown): Effect | undefined {
         name: status.name.slice(0, 40),
         description: status.description.slice(0, 120),
         remaining,
+        rarity: TRAIT_RARITIES.includes(status.rarity as TraitRarity) ? status.rarity as TraitRarity : "white",
         ...(stats && Object.keys(stats).length ? { stats } : {}),
         ...(cultivationBonus === undefined ? {} : { cultivationBonus }),
+        ...(alchemyBonus === undefined ? {} : { alchemyBonus }),
+        ...(explorationBonus === undefined ? {} : { explorationBonus }),
         ...(dangerModifier === undefined ? {} : { dangerModifier }),
       },
     };
@@ -455,7 +618,19 @@ function sanitizeEffect(value: unknown): Effect | undefined {
   return undefined;
 }
 
-function parseOutcome(rawText: string): AiGeneratedOutcome {
+function sanitizeNarrativeMessages(value: unknown): NarrativeMessage[] {
+  if (!Array.isArray(value)) return [];
+  return value.flatMap((entry) => {
+    if (!entry || typeof entry !== "object") return [];
+    const source = entry as Record<string, unknown>;
+    const speaker = textValue(source.speaker, "旁白", 30);
+    const text = textValue(source.text, "", 300);
+    const side: NarrativeMessage["side"] = source.side === "player" || source.side === "other" || source.side === "narrator" ? source.side : "other";
+    return text ? [{ speaker, text, side }] : [];
+  }).slice(0, 8);
+}
+
+function parseOutcome(rawText: string, game?: GameState, allowDerivativeContent = false): AiGeneratedOutcome {
   const parsed = extractJson(rawText);
   if (!parsed || typeof parsed !== "object") throw new Error("AI 返回对象无效");
   const value = parsed as Record<string, unknown>;
@@ -465,12 +640,18 @@ function parseOutcome(rawText: string): AiGeneratedOutcome {
   const parsedEffects = value.effects.map(sanitizeEffect);
   if (parsedEffects.some((effect) => !effect)) throw new Error("AI 返回了无法识别的属性变化");
   const effects = parsedEffects.filter((effect): effect is Effect => Boolean(effect)).slice(0, 12);
+  const rawWorldContent = value.worldContent ?? value.generatedContent;
+  const generatedContent = game && allowDerivativeContent && hasContentEntries(rawWorldContent)
+    ? parseContentBundle(JSON.stringify(rawWorldContent), game)
+    : undefined;
   return {
     title: typeof value.title === "string" && value.title.trim() ? value.title.trim().slice(0, 24) : undefined,
     text: value.text.trim().slice(0, 500),
     tone,
     effects,
     relationshipDelta: boundedNumber(value.relationshipDelta, -30, 30, true),
+    conversation: sanitizeNarrativeMessages(value.conversation),
+    ...(generatedContent ? { generatedContent } : {}),
   };
 }
 
@@ -618,7 +799,7 @@ function sanitizeQuestStage(value: unknown, index: number, fallbackRole: Locatio
   const source = value as Record<string, unknown>;
   const kind = source.kind === "condition" ? "condition" : "encounter";
   const choices = kind === "encounter" && Array.isArray(source.choices)
-    ? source.choices.flatMap((entry, choiceIndex) => { const choice = sanitizeQuestChoice(entry, choiceIndex); return choice ? [choice] : []; }).slice(0, 4)
+    ? source.choices.flatMap((entry, choiceIndex) => { const choice = sanitizeQuestChoice(entry, choiceIndex); return choice ? [choice] : []; }).slice(0, 5)
     : undefined;
   return {
     id: safeIdentifier(source.id, `stage-${index + 1}`),
@@ -834,6 +1015,113 @@ function parseContentBundle(rawText: string, game: GameState): AiGeneratedConten
   };
 }
 
+function parseEventRewrite(rawText: string, game: GameState, current: EventDefinition, allowDerivativeContent: boolean): AiEventRewrite {
+  const parsed = extractJson(rawText);
+  if (!parsed || typeof parsed !== "object") throw new Error("AI 返回的事件重构不是对象");
+  const value = parsed as Record<string, unknown>;
+  const knownFlags = new Set(game.flags);
+  const prefix = `ai-rewrite-${game.turn}-${Date.now().toString(36)}`.replace(/[^a-zA-Z0-9-]/g, "-");
+  const rawEvent = value.event && typeof value.event === "object" ? value.event : value;
+  const sanitized = sanitizeEventDefinition(rawEvent, 0, game, prefix, knownFlags);
+  const event = sanitized ? { ...current, ...sanitized, id: current.id, once: current.once } : current;
+  const followUpEvents = (Array.isArray(value.followUpEvents) ? value.followUpEvents : []).flatMap((entry, index) => {
+    const followUp = sanitizeEventDefinition(entry, index + 1, game, prefix, knownFlags);
+    return followUp ? [followUp] : [];
+  }).slice(0, 3);
+  const rawWorldContent = value.worldContent ?? value.generatedContent;
+  const generatedContent = allowDerivativeContent && hasContentEntries(rawWorldContent)
+    ? parseContentBundle(JSON.stringify(rawWorldContent), game)
+    : undefined;
+  return {
+    event,
+    followUpEvents,
+    ...(generatedContent ? { generatedContent } : {}),
+    narrative: typeof value.narrative === "string" ? value.narrative.trim().slice(0, 800) : undefined,
+  };
+}
+
+function parseFollowUpEvents(value: Record<string, unknown>, game: GameState, prefix: string, knownFlags: Set<string>): EventDefinition[] {
+  return (Array.isArray(value.followUpEvents) ? value.followUpEvents : []).flatMap((entry, index) => {
+    const followUp = sanitizeEventDefinition(entry, index + 1, game, prefix, knownFlags);
+    return followUp ? [followUp] : [];
+  }).slice(0, 3);
+}
+
+function parseResultRewrite(rawText: string, game: GameState, current: EventResult, allowDerivativeContent: boolean): AiResultRewrite {
+  const parsed = extractJson(rawText);
+  if (!parsed || typeof parsed !== "object") throw new Error("AI 返回的结果重构不是对象");
+  const value = parsed as Record<string, unknown>;
+  const choices = (Array.isArray(value.choices) ? value.choices : []).flatMap((entry, index) => {
+    const choice = sanitizeQuestChoice(entry, index);
+    return choice ? [{ ...choice, outcomes: choice.outcomes.map(({ result: _result, ...outcome }) => outcome) }] : [];
+  }).slice(0, 5);
+  if (!choices.length) throw new Error("AI 没有为当前结果生成可用选项");
+  const knownFlags = new Set(game.flags);
+  const prefix = `ai-result-${game.turn}-${Date.now().toString(36)}`.replace(/[^a-zA-Z0-9-]/g, "-");
+  const followUpEvents = parseFollowUpEvents(value, game, prefix, knownFlags);
+  const rawWorldContent = value.worldContent ?? value.generatedContent;
+  const generatedContent = allowDerivativeContent && hasContentEntries(rawWorldContent)
+    ? parseContentBundle(JSON.stringify(rawWorldContent), game)
+    : undefined;
+  return {
+    title: textValue(value.title, current.title, 60),
+    text: textValue(value.text, current.text, 900),
+    tone: TONES.includes(value.tone as Tone) ? value.tone as Tone : current.tone,
+    choices,
+    conversation: sanitizeNarrativeMessages(value.conversation),
+    followUpEvents,
+    ...(generatedContent ? { generatedContent } : {}),
+    narrative: typeof value.narrative === "string" ? value.narrative.trim().slice(0, 800) : undefined,
+  };
+}
+
+function parseQuestStageRewrite(rawText: string, game: GameState, current: QuestStageDefinition, allowDerivativeContent: boolean): AiQuestStageRewrite {
+  const parsed = extractJson(rawText);
+  if (!parsed || typeof parsed !== "object") throw new Error("AI 返回的任务阶段重构不是对象");
+  const value = parsed as Record<string, unknown>;
+  const rawStage = value.stage && typeof value.stage === "object" ? value.stage : value;
+  const sanitized = sanitizeQuestStage(rawStage, 0, getCurrentLocation(game).role);
+  if (!sanitized?.choices?.length) throw new Error("AI 没有为当前任务阶段生成可用选项");
+  const stage: QuestStageDefinition = {
+    ...current,
+    ...sanitized,
+    id: current.id,
+    kind: "encounter",
+    objective: current.objective,
+    locationRoles: current.locationRoles,
+  };
+  const knownFlags = new Set(game.flags);
+  const prefix = `ai-quest-stage-${game.turn}-${Date.now().toString(36)}`.replace(/[^a-zA-Z0-9-]/g, "-");
+  const followUpEvents = parseFollowUpEvents(value, game, prefix, knownFlags);
+  const rawWorldContent = value.worldContent ?? value.generatedContent;
+  const generatedContent = allowDerivativeContent && hasContentEntries(rawWorldContent)
+    ? parseContentBundle(JSON.stringify(rawWorldContent), game)
+    : undefined;
+  return {
+    stage,
+    followUpEvents,
+    ...(generatedContent ? { generatedContent } : {}),
+    narrative: typeof value.narrative === "string" ? value.narrative.trim().slice(0, 800) : undefined,
+  };
+}
+
+function parseExplore(rawText: string, game: GameState, allowDerivativeContent: boolean): AiExploreResult {
+  const parsed = extractJson(rawText);
+  if (!parsed || typeof parsed !== "object") throw new Error("AI 返回的探索结果不是对象");
+  const value = parsed as Record<string, unknown>;
+  const outcome = parseOutcome(JSON.stringify(value));
+  const conversation = sanitizeNarrativeMessages(value.conversation);
+  const rawWorldContent = value.worldContent ?? value.generatedContent;
+  const generatedContent = allowDerivativeContent && hasContentEntries(rawWorldContent)
+    ? parseContentBundle(JSON.stringify(rawWorldContent), game)
+    : undefined;
+  return {
+    ...outcome,
+    conversation: conversation.length ? conversation : [{ speaker: "旁白", text: outcome.text, side: "narrator" }],
+    ...(generatedContent ? { generatedContent } : {}),
+  };
+}
+
 function parseTraitOptions(rawText: string): TraitDefinition[] {
   const parsed = extractJson(rawText);
   if (!parsed || typeof parsed !== "object") throw new Error("AI 返回的词条不是对象");
@@ -849,29 +1137,31 @@ function parseTraitOptions(rawText: string): TraitDefinition[] {
   return traits.slice(0, 12);
 }
 
-async function requestOutcome(settings: AiSettings, payload: Record<string, unknown>): Promise<AiGeneratedOutcome> {
+async function requestOutcome(settings: AiSettings, payload: Record<string, unknown>, game?: GameState, allowDerivativeContent = false): Promise<AiGeneratedOutcome> {
   if (!isAiConfigured(settings)) throw new Error("请先完整填写 AI 接口、密钥和模型");
+  const enrichedPayload = { ...payload, allowDerivativeContent };
   const body = settings.format === "claude"
     ? {
       model: modelName(settings),
-      max_tokens: 900,
+      max_tokens: OUTCOME_MAX_TOKENS,
       temperature: 0.8,
       stream: false,
       system: SYSTEM_PROMPT,
-      messages: [{ role: "user", content: JSON.stringify(payload) }],
+      messages: [{ role: "user", content: JSON.stringify(enrichedPayload) }],
     }
     : {
       model: modelName(settings),
+      max_tokens: OUTCOME_MAX_TOKENS,
       temperature: 0.8,
       stream: false,
-      messages: [{ role: "system", content: SYSTEM_PROMPT }, { role: "user", content: JSON.stringify(payload) }],
+      messages: [{ role: "system", content: SYSTEM_PROMPT }, { role: "user", content: JSON.stringify(enrichedPayload) }],
     };
   const response = await requestJson(completionEndpoint(settings), { method: "POST", headers: headers(settings), body: JSON.stringify(body) });
   const directOutcome = response && typeof response === "object" && typeof (response as { text?: unknown }).text === "string" && Array.isArray((response as { effects?: unknown }).effects);
-  if (directOutcome) return parseOutcome(JSON.stringify(response));
+  if (directOutcome) return parseOutcome(JSON.stringify(response), game, allowDerivativeContent);
   const content = responseText(response);
   if (!content) throw new Error("AI 响应中没有可解析的文案");
-  return parseOutcome(content);
+  return parseOutcome(content, game, allowDerivativeContent);
 }
 
 async function requestContent(settings: AiSettings, game: GameState, trigger: AiQuestGenerationTrigger): Promise<AiGeneratedContentBundle> {
@@ -908,8 +1198,29 @@ async function requestContent(settings: AiSettings, game: GameState, trigger: Ai
   return parseContentBundle(content, game);
 }
 
-export async function requestAiAction(settings: AiSettings, game: GameState, action: ActionDefinition, durationDays: number): Promise<AiGeneratedOutcome> {
-  return requestOutcome(settings, actionPayload(game, action, durationDays));
+async function requestNarrativeJson(settings: AiSettings, system: string, payload: Record<string, unknown>, maxTokens: number, timeoutMs: number): Promise<unknown> {
+  if (!isAiConfigured(settings)) throw new Error("请先完整填写 AI 接口、密钥和模型");
+  const body = settings.format === "claude"
+    ? {
+      model: modelName(settings),
+      max_tokens: maxTokens,
+      temperature: 1,
+      stream: false,
+      system,
+      messages: [{ role: "user", content: JSON.stringify(payload) }],
+    }
+    : {
+      model: modelName(settings),
+      max_tokens: maxTokens,
+      temperature: 1,
+      stream: false,
+      messages: [{ role: "system", content: system }, { role: "user", content: JSON.stringify(payload) }],
+    };
+  return requestJson(completionEndpoint(settings), { method: "POST", headers: headers(settings), body: JSON.stringify(body) }, timeoutMs);
+}
+
+export async function requestAiAction(settings: AiSettings, game: GameState, action: ActionDefinition, durationDays: number, allowDerivativeContent = false): Promise<AiGeneratedOutcome> {
+  return requestOutcome(settings, actionPayload(game, action, durationDays), game, allowDerivativeContent);
 }
 
 export async function requestAiStartingTraits(settings: AiSettings, candidate: CharacterCandidate, level: number, optionCount: number, seed: number): Promise<TraitDefinition[]> {
@@ -950,12 +1261,107 @@ export async function requestAiStartingTraits(settings: AiSettings, candidate: C
   return parseTraitOptions(content);
 }
 
-export async function requestAiEvent(settings: AiSettings, game: GameState, event: EventDefinition, choice?: EventChoice): Promise<AiGeneratedOutcome> {
-  return requestOutcome(settings, eventPayload(game, event, choice));
+export async function requestAiEvent(settings: AiSettings, game: GameState, event: EventDefinition, choice?: EventChoice, allowDerivativeContent = false): Promise<AiGeneratedOutcome> {
+  return requestOutcome(settings, eventPayload(game, event, choice), game, allowDerivativeContent);
 }
 
-export async function requestAiQuest(settings: AiSettings, game: GameState, quest: QuestDefinition, stage: QuestStageDefinition, choice?: QuestChoice): Promise<AiGeneratedOutcome> {
-  return requestOutcome(settings, questPayload(game, quest, stage, choice));
+export async function requestAiEventRewrite(settings: AiSettings, game: GameState, event: EventDefinition, allowDerivativeContent: boolean): Promise<AiEventRewrite> {
+  const payload = {
+    kind: "event_rewrite",
+    event: {
+      id: event.id,
+      title: event.title,
+      body: event.body,
+      actions: event.actions,
+      locationRoles: event.locationRoles,
+      durationDays: event.durationDays ?? 1,
+      choices: event.choices,
+      outcomes: event.outcomes ?? [],
+    },
+    allowDerivativeContent,
+    context: contextFor(game),
+  };
+  const response = await requestNarrativeJson(settings, EVENT_REWRITE_SYSTEM_PROMPT, payload, EVENT_REWRITE_MAX_TOKENS, EVENT_REWRITE_TIMEOUT);
+  const direct = response && typeof response === "object" && ("event" in response || "followUpEvents" in response) ? JSON.stringify(response) : responseText(response);
+  if (!direct) throw new Error("AI 响应中没有可解析的事件重构");
+  return parseEventRewrite(direct, game, event, allowDerivativeContent);
+}
+
+export async function requestAiResultRewrite(settings: AiSettings, game: GameState, result: EventResult, allowDerivativeContent: boolean): Promise<AiResultRewrite> {
+  const payload = {
+    kind: "result_rewrite",
+    result: {
+      kind: result.kind,
+      title: result.title,
+      text: result.text,
+      tone: result.tone,
+      changes: result.changes,
+      durationDays: result.durationDays ?? 0,
+      conversation: result.conversation ?? [],
+      currentChoices: result.choices ?? [],
+    },
+    allowDerivativeContent,
+    context: contextFor(game),
+  };
+  const response = await requestNarrativeJson(settings, RESULT_REWRITE_SYSTEM_PROMPT, payload, DIALOG_REWRITE_MAX_TOKENS, DIALOG_REWRITE_TIMEOUT);
+  const direct = isDirectResultRewriteResponse(response) ? JSON.stringify(response) : responseText(response);
+  if (!direct) throw new Error("AI 响应中没有可解析的结果重构");
+  return parseResultRewrite(direct, game, result, allowDerivativeContent);
+}
+
+export async function requestAiQuestStageRewrite(settings: AiSettings, game: GameState, quest: QuestDefinition, stage: QuestStageDefinition, allowDerivativeContent: boolean): Promise<AiQuestStageRewrite> {
+  const payload = {
+    kind: "quest_stage_rewrite",
+    quest: { id: quest.id, title: quest.title, summary: quest.summary },
+    stage: {
+      id: stage.id,
+      title: stage.title,
+      body: stage.body,
+      kind: stage.kind,
+      objective: stage.objective,
+      locationRoles: stage.locationRoles,
+      durationDays: stage.durationDays ?? 1,
+      choices: stage.choices ?? [],
+    },
+    allowDerivativeContent,
+    context: contextFor(game),
+  };
+  const response = await requestNarrativeJson(settings, QUEST_STAGE_REWRITE_SYSTEM_PROMPT, payload, DIALOG_REWRITE_MAX_TOKENS, DIALOG_REWRITE_TIMEOUT);
+  const direct = isDirectQuestStageRewriteResponse(response) ? JSON.stringify(response) : responseText(response);
+  if (!direct) throw new Error("AI 响应中没有可解析的任务阶段重构");
+  return parseQuestStageRewrite(direct, game, stage, allowDerivativeContent);
+}
+
+export async function requestAiExplore(settings: AiSettings, game: GameState, allowDerivativeContent: boolean): Promise<AiExploreResult> {
+  const location = getCurrentLocation(game);
+  const npcs = game.npcs.filter((npc) => npc.alive && npc.locationId === location.id).slice(0, 12).map((npc) => ({
+    id: npc.id,
+    name: npc.name,
+    gender: npc.gender,
+    identity: npc.identity,
+    personality: npc.personality,
+    description: npc.description,
+    ageYears: Number(npc.age.toFixed(1)),
+    realmStage: npc.realmStage,
+    battlePower: npc.battlePower,
+    relationship: npc.relationship,
+    relationshipType: npc.relationshipType,
+  }));
+  const payload = {
+    kind: "explore",
+    allowDerivativeContent,
+    location: { id: location.id, name: location.name, role: location.role, subtitle: location.subtitle, description: location.description, danger: location.danger, modifiers: location.modifiers },
+    npcs,
+    context: contextFor(game),
+  };
+  const response = await requestNarrativeJson(settings, EXPLORE_SYSTEM_PROMPT, payload, EXPLORE_MAX_TOKENS, EXPLORE_TIMEOUT);
+  const direct = response && typeof response === "object" && ("text" in response || "conversation" in response) ? JSON.stringify(response) : responseText(response);
+  if (!direct) throw new Error("AI 响应中没有可解析的探索结果");
+  return parseExplore(direct, game, allowDerivativeContent);
+}
+
+export async function requestAiQuest(settings: AiSettings, game: GameState, quest: QuestDefinition, stage: QuestStageDefinition, choice?: QuestChoice, allowDerivativeContent = false): Promise<AiGeneratedOutcome> {
+  return requestOutcome(settings, questPayload(game, quest, stage, choice), game, allowDerivativeContent);
 }
 
 export async function requestAiContent(settings: AiSettings, game: GameState, trigger: AiQuestGenerationTrigger): Promise<AiGeneratedContentBundle> {
@@ -966,12 +1372,12 @@ export async function requestAiQuestGeneration(settings: AiSettings, game: GameS
   return requestContent(settings, game, trigger);
 }
 
-export async function requestAiNpcInteraction(settings: AiSettings, game: GameState, npc: Npc, interaction: NpcInteractionDefinition): Promise<AiGeneratedOutcome> {
-  return requestOutcome(settings, npcPayload(game, npc, interaction));
+export async function requestAiNpcInteraction(settings: AiSettings, game: GameState, npc: Npc, interaction: NpcInteractionDefinition, allowDerivativeContent = false): Promise<AiGeneratedOutcome> {
+  return requestOutcome(settings, npcPayload(game, npc, interaction), game, allowDerivativeContent);
 }
 
-export async function requestAiTravel(settings: AiSettings, game: GameState, target: { id: string; name: string; subtitle: string; description: string; danger: string; travelCost: number }): Promise<AiGeneratedOutcome> {
-  return requestOutcome(settings, travelPayload(game, target));
+export async function requestAiTravel(settings: AiSettings, game: GameState, target: { id: string; name: string; subtitle: string; description: string; danger: string; travelCost: number }, allowDerivativeContent = false): Promise<AiGeneratedOutcome> {
+  return requestOutcome(settings, travelPayload(game, target), game, allowDerivativeContent);
 }
 
 export async function requestAiLifeResume(settings: AiSettings, archive: LifeArchive): Promise<string> {

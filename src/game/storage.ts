@@ -108,7 +108,7 @@ function normalizeTrait(value: unknown): TraitDefinition | undefined {
   const source = value as Partial<TraitDefinition>;
   if (typeof source.id !== "string" || typeof source.name !== "string" || typeof source.description !== "string") return undefined;
   const rarity = TRAIT_RARITIES.includes(source.rarity as TraitRarity) ? source.rarity as TraitRarity : "white";
-  const cost = typeof source.cost === "number" && Number.isFinite(source.cost) ? Math.max(1, Math.min(8, Math.round(source.cost))) : 1;
+  const cost = typeof source.cost === "number" && Number.isFinite(source.cost) ? Math.max(0, Math.min(8, Math.round(source.cost))) : 1;
   const stats: Partial<CoreStats> = {};
   TRAIT_STAT_KEYS.forEach((key) => {
     const amount = source.stats?.[key];
@@ -253,6 +253,15 @@ function normalizeGame(game: GameState): GameState {
     pills: inventoryMap.get("barrier-pill") ?? 0,
   };
   const rawTraits = (game.character as Partial<GameState["character"]>).traits;
+  const rawStatuses = (game as Partial<GameState>).statuses;
+  const statuses = Array.isArray(rawStatuses) ? rawStatuses.flatMap((status) => {
+    if (!status || typeof status !== "object" || typeof status.id !== "string" || typeof status.name !== "string" || typeof status.description !== "string" || typeof status.remaining !== "number" || !Number.isFinite(status.remaining)) return [];
+    return [{
+      ...status,
+      remaining: Math.max(1, Math.round(status.remaining)),
+      rarity: TRAIT_RARITIES.includes(status.rarity as TraitRarity) ? status.rarity as TraitRarity : "white",
+    }];
+  }) : [];
   const character = {
     ...game.character,
     gender: game.character.gender === "male" || game.character.gender === "female" ? game.character.gender : "unknown",
@@ -276,7 +285,7 @@ function normalizeGame(game: GameState): GameState {
   const generatedQuests = Array.isArray((game as Partial<GameState>).generatedQuests) ? game.generatedQuests : [];
   const generatedEvents = Array.isArray((game as Partial<GameState>).generatedEvents) ? game.generatedEvents : [];
   const generatedItems = Array.isArray((game as Partial<GameState>).generatedItems) ? game.generatedItems : [];
-  const normalized = { ...game, character, resources: normalizedResources, world, npcs, inventory: normalizedInventory, pendingEventId, pendingEventQueue: pendingEventQueue.length ? pendingEventQueue : undefined, travelPlan: travelPlan?.length ? travelPlan : undefined, questOffers, quests, generatedQuests, generatedEvents, generatedItems } as GameState;
+  const normalized = { ...game, character, resources: normalizedResources, statuses, world, npcs, inventory: normalizedInventory, pendingEventId, pendingEventQueue: pendingEventQueue.length ? pendingEventQueue : undefined, travelPlan: travelPlan?.length ? travelPlan : undefined, questOffers, quests, generatedQuests, generatedEvents, generatedItems } as GameState;
   return initializeQuestSystem(normalized);
 }
 

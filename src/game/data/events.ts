@@ -28,7 +28,7 @@ export const EVENTS: EventDefinition[] = [
     gainChoice("leave", "绕路离开", "稳妥", "你们互相尊重了彼此的戒心。", [{ type: "resource", key: "mind", amount: 2 }]),
   ], { once: true }),
   simple("fox-return", "月下衔枝", "银灰灵狐从月影中现身，将一枚沾着妖血的果子丢到你面前。看来它记得你。", ["cultivate", "rest"], [
-    gainChoice("accept", "收下灵果", "一段善缘", "灵果入口清凉，滞涩的经脉随之松动。", [{ type: "resource", key: "cultivation", amount: 20 }, { type: "resource", key: "health", amount: 8 }]),
+    gainChoice("accept", "收下灵果", "一段善缘", "灵果入口清凉，滞涩的经脉随之松动。", [{ type: "item", itemId: "rejuvenation-elixir", amount: 1 }, { type: "resource", key: "cultivation", amount: 20 }, { type: "resource", key: "health", amount: 8 }]),
   ], { once: true, requireFlag: "fox-kindness", minStage: 2 }),
   simple("tax-collector", "山神收税", "一块刻着“山神有令”的木牌拦在路中，旁边趴着一只炼气小妖，算盘拨得飞快。", ["explore", "gather"], [
     { id: "pay", label: "照章缴纳", hint: "花费 5 灵石", requirement: { resource: { spiritStones: 5 } }, outcomes: [{ weight: 1, text: "小妖开了张墨迹未干的收据。异界的官僚体系令你肃然起敬。", tone: "neutral", effects: [{ type: "resource", key: "spiritStones", amount: -5 }] }] },
@@ -78,14 +78,14 @@ export const EVENTS: EventDefinition[] = [
   simple("mimic-herb", "会跑的灵草", "一株赤叶草拔出根须狂奔。", ["gather"], [gainChoice("negotiate", "以灵气诱它回来", "神识有利", "它留下一片叶子。", [{ type: "resource", key: "herbs", amount: 2 }, { type: "resource", key: "qi", amount: -6 }])]),
   simple("bad-cauldron", "炉火反噬", "丹炉发出一声闷响。", ["alchemy"], [gainChoice("duck", "果断伏地", "稳妥", "炉盖擦着头顶飞过。", [{ type: "resource", key: "mind", amount: 2 }])]),
   simple("perfect-pill", "丹成异香", "炉中丹丸圆润，药香凝而不散。", ["alchemy"], [gainChoice("taste", "趁热服下", "直接炼化药力", "修为向前推了一截。", [{ type: "resource", key: "cultivation", amount: 18 }])]),
-  simple("sect-recruiter", "山门招新", "青霄门执事在坊市测灵。", ["market", "explore"], [gainChoice("watch", "旁观流程", "不自取其辱", "你记下几句安慰落选者的话。", [{ type: "resource", key: "mind", amount: 3 }])], { once: true }),
+  simple("sect-recruiter", "山门招新", "青霄门执事在坊市测灵。", ["market", "explore"], [gainChoice("watch", "旁观流程", "不自取其辱", "你替执事维持秩序，对方临走时给了你一枚外门行走牌。", [{ type: "resource", key: "mind", amount: 3 }, { type: "trait", trait: { id: "outer-sect-walker", name: "山门行走", description: "曾替宗门办过一桩小事，在部分修士眼中算是半个熟人。", rarity: "green", cost: 0, stats: { fortune: 1 }, resources: { spiritStones: 4 } } }])], { once: true }),
   simple("corpse-bag", "无主储物袋", "路边储物袋完整得过于刻意。", ["explore"], [gainChoice("bury", "掩埋尸身", "积一点阴德", "你获得片刻心安。", [{ type: "stat", key: "fortune", amount: 1 }])], { once: true }),
   simple("white-deer", "白鹿引路", "雾中白鹿回首看你。", ["explore", "gather"], [gainChoice("bow", "遥遥一礼", "不强求机缘", "白鹿没入雾中。", [{ type: "resource", key: "mind", amount: 4 }])]),
   simple("night-knock", "夜半敲门", "子夜有人在门外轻敲三声。", ["rest", "cultivate"], [gainChoice("ward", "贴符不理", "稳妥", "敲门声持续到天亮。", [{ type: "resource", key: "mind", amount: -2 }])]),
   simple("wandering-sword", "断剑低鸣", "泥中斜插着半截断剑。", ["explore"], [gainChoice("sell", "连泥拔走", "换取灵石", "铁匠按废铁价成交。", [{ type: "resource", key: "spiritStones", amount: 7 }])], { once: true, minStage: 2 }),
   simple("spirit-moth", "噬灵飞蛾", "成群飞蛾扑向你的灵气。", ["cultivate", "gather"], [gainChoice("flee", "暂避锋芒", "稳妥", "飞蛾终于散去。", [{ type: "resource", key: "qi", amount: -4 }])]),
   simple("wine-monk", "醉酒僧人", "醉僧拦路与你论禅。", ["explore", "rest"], [gainChoice("listen", "听他讲完", "磨炼心境", "你从醉话中悟到一丝道理。", [{ type: "resource", key: "mind", amount: 6 }])]),
-  simple("ancient-tablet", "无字古碑", "荒野古碑不着一字，却让人不敢直视。", ["explore", "rest"], [gainChoice("meditate", "碑前参悟", "悟性有利", "你从无字中读出一丝道韵。", [{ type: "resource", key: "cultivation", amount: 20 }])], { once: true }),
+  simple("ancient-tablet", "无字古碑", "荒野古碑不着一字，却让人不敢直视。", ["explore", "rest"], [gainChoice("meditate", "碑前参悟", "悟性有利", "你从无字中读出一丝道韵，余韵数日不散。", [{ type: "resource", key: "cultivation", amount: 20 }, { type: "trait", durationDays: 12, trait: { id: "wordless-insight", name: "无字碑悟", description: "古碑余韵盘桓识海，暂时令修行更易触类旁通。", rarity: "blue", cost: 0, stats: { insight: 1 }, cultivationBonus: 0.12 } }])], { once: true }),
   simple("healing-spring", "温泉白骨", "山间温泉灵气充沛，池边却整齐摆着三具白骨，像是排队等你加入。", ["rest", "explore"], [
     { id: "bathe", label: "入泉疗伤", hint: "收益丰厚，略有风险", outcomes: [
       { weight: 7, text: "泉水洗去疲惫。白骨很安静，服务态度无可挑剔。", tone: "good", effects: [{ type: "resource", key: "health", amount: 25 }, { type: "resource", key: "qi", amount: 15 }] },
@@ -222,7 +222,7 @@ export const EVENTS: EventDefinition[] = [
     ] },
   ]),
   simple("road-spirit-caravan", "灵兽商队", "一队驮山兽堵住狭路，背上的货箱比房屋还大。商队管事正在为一只拒绝前进的幼兽发愁。", ["travel"], [
-    { id: "help", label: "以灵气安抚", hint: "消耗 6 灵力", requirement: { resource: { qi: 6 } }, outcomes: [{ weight: 1, text: "幼兽终于迈步。管事送你几块灵石，并坚称这不是误工赔偿。", tone: "good", effects: [{ type: "resource", key: "qi", amount: -6 }, { type: "resource", key: "spiritStones", amount: 9 }] }] },
+    { id: "help", label: "以灵气安抚", hint: "消耗 6 灵力", requirement: { resource: { qi: 6 } }, outcomes: [{ weight: 1, text: "幼兽终于迈步。管事送你一束云蚕丝，并坚称这不是误工赔偿。", tone: "good", effects: [{ type: "resource", key: "qi", amount: -6 }, { type: "item", itemId: "cloud-silk", amount: 1 }] }] },
     gainChoice("wait", "在路边等候", "恢复少量心境", "你看着商队折腾了半日，忽然觉得自己的道途也没那么混乱。", [{ type: "resource", key: "mind", amount: 5 }]),
   ]),
   simple("final-omen", "突破天兆", "云层中有金线交织，界蚀印疼得像要从掌心挣脱。你知道新的关口正在靠近。", ["cultivate", "rest"], [

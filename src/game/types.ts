@@ -52,6 +52,14 @@ export interface AiGeneratedOutcome {
   tone: Tone;
   effects: Effect[];
   relationshipDelta?: number;
+  conversation?: NarrativeMessage[];
+  generatedContent?: AiGeneratedContentBundle;
+}
+
+export interface NarrativeMessage {
+  speaker: string;
+  text: string;
+  side: "player" | "other" | "narrator";
 }
 
 export type WorldSize = "small" | "medium" | "large" | "custom";
@@ -237,14 +245,19 @@ export interface StatusEffect {
   name: string;
   description: string;
   remaining: number;
+  rarity?: TraitRarity;
   stats?: Partial<CoreStats>;
   cultivationBonus?: number;
+  alchemyBonus?: number;
+  explorationBonus?: number;
   dangerModifier?: number;
 }
 
 export type Effect =
   | { type: "resource"; key: ResourceKey; amount: number }
   | { type: "stat"; key: CoreStat; amount: number }
+  | { type: "item"; itemId: string; amount: number }
+  | { type: "trait"; trait: TraitDefinition; durationDays?: number }
   | { type: "status"; status: StatusEffect }
   | { type: "flag"; key: string };
 
@@ -265,6 +278,9 @@ export interface EventOutcome {
 export interface EventResultChange {
   label: string;
   amount: number;
+  trait?: TraitDefinition | StatusEffect;
+  remainingDays?: number;
+  itemRarity?: ItemRarity;
 }
 
 export interface GeneratedContentSummary {
@@ -283,6 +299,9 @@ export interface EventResult {
   changes: EventResultChange[];
   durationDays?: number;
   generatedContent?: GeneratedContentSummary;
+  conversation?: NarrativeMessage[];
+  /** Optional next-step branches added by AI thinking on this exact dialog. */
+  choices?: EventChoice[];
 }
 
 export interface EventChoice {
@@ -309,6 +328,24 @@ export interface EventDefinition {
   excludeFlag?: string;
   locationRoles?: LocationRole[];
   durationDays?: number;
+}
+
+export interface AiEventRewrite {
+  event: EventDefinition;
+  followUpEvents: EventDefinition[];
+  generatedContent?: AiGeneratedContentBundle;
+  narrative?: string;
+}
+
+export interface AiResultRewrite {
+  title: string;
+  text: string;
+  tone: Tone;
+  choices: EventChoice[];
+  conversation?: NarrativeMessage[];
+  followUpEvents: EventDefinition[];
+  generatedContent?: AiGeneratedContentBundle;
+  narrative?: string;
 }
 
 export type QuestStatus = "active" | "completed" | "failed" | "abandoned";
@@ -341,6 +378,13 @@ export interface QuestStageDefinition {
   objective?: QuestObjective;
   choices?: QuestChoice[];
   durationDays?: number;
+}
+
+export interface AiQuestStageRewrite {
+  stage: QuestStageDefinition;
+  followUpEvents: EventDefinition[];
+  generatedContent?: AiGeneratedContentBundle;
+  narrative?: string;
 }
 
 export interface QuestDefinition {
@@ -412,6 +456,11 @@ export interface AiGeneratedContentBundle extends AiGeneratedQuestBundle {
   locations: AiGeneratedLocationDraft[];
   items: ItemDefinition[];
   npcs: Npc[];
+}
+
+export interface AiExploreResult extends AiGeneratedOutcome {
+  conversation: NarrativeMessage[];
+  generatedContent?: AiGeneratedContentBundle;
 }
 
 export interface WorldLocation {
@@ -514,6 +563,10 @@ export interface GameState {
   pendingEventId?: string;
   /** Events triggered while another event is awaiting resolution. */
   pendingEventQueue?: string[];
+  /** A temporary AI rewrite of the event currently shown to the player. */
+  pendingEventDraft?: EventDefinition;
+  /** Additional AI-authored rounds that follow the current event. */
+  pendingEventDraftQueue?: EventDefinition[];
   questOffers: QuestOffer[];
   quests: QuestProgress[];
   /** AI-authored quest definitions retained with this life/save. */
@@ -524,6 +577,10 @@ export interface GameState {
   /** Last in-game day on which continuous AI world generation completed. */
   aiContentLastTurn?: number;
   pendingQuestId?: string;
+  /** A temporary AI rewrite of the quest stage currently shown. */
+  pendingQuestDraft?: QuestStageDefinition;
+  /** Generated content waiting to be disclosed by the next result dialog. */
+  pendingGeneratedContent?: GeneratedContentSummary;
   /** Remaining destination ids for an automatically planned multi-hop journey. */
   travelPlan?: string[];
   eventResult?: EventResult;

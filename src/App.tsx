@@ -58,14 +58,13 @@ import { ACTIONS, ITEM_CATEGORY_NAMES, ITEM_RARITY_NAMES, NPC_IDENTITIES, NPC_IN
 import {
   fetchAiModels,
   isAiConfigured,
-  requestAiAction,
   requestAiContent,
-  requestAiEvent,
+  requestAiEventRewrite,
+  requestAiExplore,
   requestAiLifeResume,
-  requestAiNpcInteraction,
-  requestAiQuest,
+  requestAiQuestStageRewrite,
+  requestAiResultRewrite,
   requestAiStartingTraits,
-  requestAiTravel,
 } from "./game/ai";
 import {
   breakthrough,
@@ -97,7 +96,7 @@ import {
   abandonQuest,
   addGeneratedContent,
   resolveQuestStage,
-  resolveQuestStageWithAi,
+  resolveEventResultChoice,
   getNpcRelationshipLabel,
   getNpcSpecialRelationshipLabel,
   canInteractWithNpc,
@@ -109,21 +108,21 @@ import {
   buyItem,
   giftItem,
   interactWithNpc,
-  interactWithNpcWithAi,
   performActionWithAi,
   performAction,
   resolveEvent,
-  resolveEventWithAi,
+  rewritePendingEvent,
+  rewritePendingQuestStage,
+  rewriteEventResult,
   rollAiContentChance,
   startGame,
   toggleNpcAttention,
   travelTo,
-  travelToWithAi,
   sellItem,
   useItem,
 } from "./game/engine";
 import { DEFAULT_AI_PROFILE, DEFAULT_AI_SETTINGS, exportSave, importSave, loadAiProfiles, loadGame, loadMeta, saveAiProfiles, saveGame, saveMeta } from "./game/storage";
-import type { ActionDefinition, ActionId, AiProfile, AiProfileStore, AiQuestGenerationTrigger, AiSettings, CharacterCandidate, CharacterGender, ChronicleEntry, EventResult, GameState, ItemCategory, ItemDefinition, LifeArchive, MetaProgress, Npc, NpcInteractionId, NpcRelationshipType, QuestChoice, QuestDefinition, QuestProgress, QuestStageDefinition, ResourceKey, Tone, TraitDefinition, WorldLocation, WorldOptions } from "./game/types";
+import type { ActionDefinition, ActionId, AiProfile, AiProfileStore, AiQuestGenerationTrigger, AiSettings, CharacterCandidate, CharacterGender, ChronicleEntry, EventResult, GameState, ItemCategory, ItemDefinition, LifeArchive, MetaProgress, Npc, NpcInteractionId, NpcRelationshipType, QuestChoice, QuestDefinition, QuestProgress, QuestStageDefinition, ResourceKey, StatusEffect, Tone, TraitDefinition, WorldLocation, WorldOptions } from "./game/types";
 
 type Screen = "welcome" | "create" | "game";
 type MobileTab = "journey" | "map" | "npcs" | "quests" | "inventory" | "character" | "actions" | "legacy";
@@ -188,6 +187,46 @@ const locationRoleNames: Record<WorldLocation["role"], string> = {
 };
 
 const statNames = { constitution: "根骨", insight: "悟性", spirit: "神识", fortune: "气运" } as const;
+const traitResourceNames: Partial<Record<ResourceKey | "maxHealth" | "maxStamina" | "maxQi" | "maxMind", string>> = {
+  health: "体力", stamina: "体力", maxHealth: "体力上限", maxStamina: "体力上限", lifespan: "寿元", battlePower: "战力", qi: "灵力", maxQi: "灵力上限", mind: "心境", maxMind: "心境上限", cultivation: "修为", spiritStones: "灵石", herbs: "灵草", pills: "破障丹",
+};
+
+function signedValue(value: number, suffix = ""): string {
+  return `${value > 0 ? "+" : ""}${Number.isInteger(value) ? value : value.toFixed(2)}${suffix}`;
+}
+
+function traitEffectLines(trait: TraitDefinition | StatusEffect): string[] {
+  const lines: string[] = [];
+  Object.entries(trait.stats ?? {}).forEach(([key, value]) => {
+    if (typeof value === "number" && value !== 0) lines.push(`${statNames[key as keyof typeof statNames]} ${signedValue(value)}`);
+  });
+  const resources = "resources" in trait ? trait.resources : undefined;
+  Object.entries(resources ?? {}).forEach(([key, value]) => {
+    if (typeof value === "number" && value !== 0) lines.push(`${traitResourceNames[key as keyof typeof traitResourceNames] ?? key} ${signedValue(value)}`);
+  });
+  if (trait.cultivationBonus) lines.push(`修炼效率 ${signedValue(Math.round(trait.cultivationBonus * 100), "%")}`);
+  if (trait.alchemyBonus) lines.push(`炼丹成功率 ${signedValue(Math.round(trait.alchemyBonus * 100), "%")}`);
+  if (trait.explorationBonus) lines.push(`探索收益 ${signedValue(Math.round(trait.explorationBonus * 100), "%")}`);
+  if (trait.dangerModifier) lines.push(`危险倾向 ${signedValue(Math.round(trait.dangerModifier * 100), "%")}`);
+  return lines;
+}
+
+function TraitTooltip({ trait, remaining }: { trait: TraitDefinition | StatusEffect; remaining?: number }) {
+  const effects = traitEffectLines(trait);
+  return <span className="trait-tooltip" role="tooltip"><strong>{trait.name}</strong><small>{trait.description}</small>{remaining !== undefined && <em>剩余 {remaining} 天</em>}{effects.length > 0 && <span>{effects.map((line) => <b key={line}>{line}</b>)}</span>}</span>;
+}
+
+function TraitPill({ trait, remaining }: { trait: TraitDefinition | StatusEffect; remaining?: number }) {
+  const rarity = trait.rarity ?? "white";
+  return <span className={`trait-pill trait-text-${rarity}`} tabIndex={0}><span>{trait.name}{remaining !== undefined ? ` · ${remaining}天` : ""}</span><TraitTooltip trait={trait} remaining={remaining} /></span>;
+}
+
+function ResultChangeRow({ change }: { change: EventResult["changes"][number] }) {
+  const value = change.trait
+    ? change.remainingDays !== undefined ? `${change.remainingDays} 天` : "永久"
+    : change.amount > 0 ? `+${change.amount}` : change.amount;
+  return <div className={`event-result-change ${change.amount > 0 ? "event-change-positive" : "event-change-negative"}`}><span className={change.itemRarity ? `item-rarity-text rarity-${change.itemRarity}` : undefined}>{change.trait ? <TraitPill trait={change.trait} remaining={change.remainingDays} /> : change.label}</span><strong>{value}</strong></div>;
+}
 
 const npcGenderNames: Record<Npc["gender"], string> = { male: "男", female: "女", unknown: "未知" };
 
@@ -301,7 +340,7 @@ function ArchiveDialog({ meta, aiSettings, onMetaChange, onClose }: { meta: Meta
             </aside>
             {selected && <article className="archive-detail">
               <div className="archive-detail-heading"><div><span className="eyebrow">第 {archives.findIndex((archive) => archive.id === selected.id) + 1} 卷 · {selected.summary.title}</span><h3>{selected.character.name}</h3><p>{archiveGenderLabel(selected.character.gender)} · {selected.character.origin} · {selected.character.spiritRoot} · {selected.character.talent}</p></div><span className={`archive-ending archive-ending-${selected.summary.reason}`}>{selected.finalRealm}</span></div>
-              <div className="archive-character-meta"><span>根骨 <b>{selected.character.stats.constitution}</b></span><span>悟性 <b>{selected.character.stats.insight}</b></span><span>神识 <b>{selected.character.stats.spirit}</b></span><span>气运 <b>{selected.character.stats.fortune}</b></span>{selected.character.traits.length > 0 && <div className="archive-traits"><small>初始命格</small>{selected.character.traits.map((trait) => <b key={trait.id} className={`trait-text-${trait.rarity}`}>{trait.name}</b>)}</div>}</div>
+              <div className="archive-character-meta"><span>根骨 <b>{selected.character.stats.constitution}</b></span><span>悟性 <b>{selected.character.stats.insight}</b></span><span>神识 <b>{selected.character.stats.spirit}</b></span><span>气运 <b>{selected.character.stats.fortune}</b></span>{selected.character.traits.length > 0 && <div className="archive-traits"><small>人生词条</small>{selected.character.traits.map((trait) => <TraitPill key={trait.id} trait={trait} />)}</div>}</div>
               <div className="archive-facts"><span><b>行年</b>{selected.turn} 天</span><span><b>年龄</b>{formatYears(selected.age)} 岁</span><span><b>寿元</b>{formatYears(selected.lifespan)} 年</span><span><b>评分</b>{selected.summary.score}</span><span><b>见闻</b>+{selected.summary.insightEarned}</span></div>
               <p className="archive-epitaph">{selected.summary.epitaph}</p>
               <div className="archive-resume-section"><div className="archive-section-heading"><span><ScrollText size={15} />人生简历</span>{selected.resumeGeneratedAt && <small>已生成 · {new Date(selected.resumeGeneratedAt).toLocaleDateString("zh-CN")}</small>}</div>{selected.resume ? <p className="archive-resume">{selected.resume}</p> : <div className="archive-resume-empty"><p>尚未为这卷人生撰写简历。</p><button className="secondary-command" type="button" disabled={resumeBusy} onClick={() => void generateResume()}><Sparkles size={16} className={resumeBusy ? "spin" : ""} />{resumeBusy ? "AI 正在撰写…" : "AI 生成人生简历"}</button></div>}{selected.resume && <button className="text-button archive-regenerate" type="button" disabled={resumeBusy} onClick={() => void generateResume()}><RefreshCw size={15} className={resumeBusy ? "spin" : ""} />{resumeBusy ? "重新撰写中…" : "重新生成简历"}</button>}{resumeError && <p className="archive-error" role="status">{resumeError}</p>}</div>
@@ -434,7 +473,7 @@ function CreationScreen({ meta, aiSettings, onBack, onStart }: { meta: MetaProgr
         <header className="trait-draft-header"><div><span className="eyebrow">命运筹码 · 初始状态</span><h2 id="trait-draft-title">选择初始词条</h2><p>每条词条都会影响你醒来时的状态。消耗 Cost 选择，也可以用 Cost 刷新候选。AI 辅助只会改变候选文案与小幅加成。</p></div><div className="trait-draft-tools"><div className="trait-cost"><span>剩余 Cost</span><strong>{remainingCost}</strong></div><label className={`trait-ai-toggle ${!aiTraitAvailable ? "unavailable" : ""}`} title={!aiTraitAvailable ? "请先在设置中填写 API 地址、Key 和模型" : "使用 AI 生成本轮开局词条候选"}><input type="checkbox" checked={aiTraitEnabled} disabled={aiTraitLoading || !aiTraitAvailable} onChange={(event) => toggleAiTraits(event.target.checked)} /><Bot size={16} /><span>AI 辅助</span></label></div></header>
         <div className="trait-toolbar"><span>{aiTraitLoading ? "AI 正在生成词条…" : `已选 ${selectedTraits.length} 条 · 本轮提供 ${traitOptions.length} 条`}</span><button className="text-button" type="button" disabled={aiTraitLoading || remainingCost + selectedTraits.reduce((sum, trait) => sum + trait.cost, 0) < progression.refreshCost} onClick={refreshTraits}><RefreshCw size={16} className={aiTraitLoading ? "spin" : ""} />{aiTraitEnabled ? "AI 重新生成" : "刷新词条"} · {progression.refreshCost} Cost</button></div>
         {aiTraitNotice && <p className="trait-ai-notice" role="status">{aiTraitNotice}</p>}
-        <div className="trait-grid">{traitOptions.map((trait) => { const selectedTrait = selectedTraitIds.includes(trait.id); const disabled = !selectedTrait && remainingCost < trait.cost; return <button key={trait.id} type="button" className={`trait-card trait-${trait.rarity} ${selectedTrait ? "selected" : ""}`} disabled={disabled || aiTraitLoading} onClick={() => toggleTrait(trait)} aria-pressed={selectedTrait}><div className="trait-card-top"><span>{TRAIT_RARITY_NAMES[trait.rarity]}</span><strong>{trait.cost} Cost</strong></div><h3>{trait.name}</h3><p>{trait.description}</p><small>{selectedTrait ? "已纳入初始命格" : disabled ? "Cost 不足" : "点击选择"}</small></button>; })}</div>
+        <div className="trait-grid">{traitOptions.map((trait) => { const selectedTrait = selectedTraitIds.includes(trait.id); const disabled = !selectedTrait && remainingCost < trait.cost; return <button key={trait.id} type="button" className={`trait-card trait-${trait.rarity} ${selectedTrait ? "selected" : ""}`} disabled={disabled || aiTraitLoading} onClick={() => toggleTrait(trait)} aria-pressed={selectedTrait}><div className="trait-card-top"><span>{TRAIT_RARITY_NAMES[trait.rarity]}</span><strong>{trait.cost} Cost</strong></div><h3>{trait.name}</h3><p>{trait.description}</p><div className="trait-card-effects">{traitEffectLines(trait).map((line) => <b key={line}>{line}</b>)}</div><TraitTooltip trait={trait} /><small>{selectedTrait ? "已纳入初始命格" : disabled ? "Cost 不足" : "点击选择"}</small></button>; })}</div>
       </section>
       <section className="world-options" aria-label="世界设定">
         <div className="world-option-group"><div><b>主角性别</b><small>影响称谓、人物关系和部分叙事表现</small></div><div className="option-segments"><button type="button" className={gender === "male" ? "selected" : ""} onClick={() => setGender("male")}><b>男性</b><small>阳</small></button><button type="button" className={gender === "female" ? "selected" : ""} onClick={() => setGender("female")}><b>女性</b><small>阴</small></button><button type="button" className={gender === "unknown" ? "selected" : ""} onClick={() => setGender("unknown")}><b>不定</b><small>由故事决定</small></button></div></div>
@@ -464,8 +503,8 @@ function StatPanel({ game }: { game: GameState }) {
       <div className="stat-grid">
         {Object.entries(game.character.stats).map(([key, value]) => <div key={key}><span>{statNames[key as keyof typeof statNames]}</span><strong>{value}</strong></div>)}
       </div>
-      {game.character.traits?.length > 0 && <div className="character-trait-list"><span>初始词条</span><div>{game.character.traits.map((trait) => <b key={trait.id} className={`trait-text-${trait.rarity}`} title={trait.description}>{trait.name}</b>)}</div></div>}
-      {game.statuses.length > 0 && <div className="status-list">{game.statuses.map((status) => <span key={status.id} title={status.description}>{status.name} · {status.remaining}天</span>)}</div>}
+      {game.character.traits?.length > 0 && <div className="character-trait-list"><span>永久词条</span><div>{game.character.traits.map((trait) => <TraitPill key={trait.id} trait={trait} />)}</div></div>}
+      {game.statuses.length > 0 && <div className="character-trait-list temporary-trait-list"><span>临时词条</span><div>{game.statuses.map((status) => <TraitPill key={status.id} trait={status} remaining={status.remaining} />)}</div></div>}
     </section>
   );
 }
@@ -589,7 +628,7 @@ function QuestPanel({ game, onAccept, onAdvance, onAbandon, onGenerateContent, a
     return quest ? [{ progress, quest }] : [];
   });
   return <section className="quest-journal side-section" aria-labelledby="quest-journal-title">
-    <header className="quest-journal-header"><div><span className="eyebrow">委托与因果</span><h2 id="quest-journal-title">任务日志</h2></div><div className="quest-journal-tools"><span className="quest-count"><ScrollText size={16} />{active.length} / 4</span><button className="secondary-command quest-generate-button" type="button" disabled={!aiGenerationEnabled || aiGenerating} title={aiGenerationEnabled ? "让 AI 开拓新的地点、事件、任务、物品与人物" : "请先在设置中启用并配置 AI"} onClick={onGenerateContent}><Sparkles size={15} />{aiGenerating ? "生成中" : "开拓世界"}</button></div></header>
+    <header className="quest-journal-header"><div><span className="eyebrow">委托与因果</span><h2 id="quest-journal-title">任务日志</h2></div><div className="quest-journal-tools"><span className="quest-count"><ScrollText size={16} />{active.length} / 4</span><button className="secondary-command quest-generate-button" type="button" disabled={!aiGenerationEnabled || aiGenerating} title={aiGenerationEnabled ? "让 AI 开拓新的地点、事件、任务、物品与人物" : "请先在设置中配置 AI"} onClick={onGenerateContent}><Sparkles size={15} />{aiGenerating ? "生成中" : "开拓世界"}</button></div></header>
     {offers.length > 0 && <section className="quest-group"><div className="quest-group-heading"><h3>此地传来的委托</h3><small>{getCurrentLocation(game).name}</small></div><div className="quest-list">{offers.map(({ quest }) => <QuestOfferCard key={quest.id} game={game} quest={quest} onAccept={onAccept} />)}</div></section>}
     <section className="quest-group"><div className="quest-group-heading"><h3>进行中的任务</h3><small>{active.length ? "按阶段推进" : "尚无追踪中的任务"}</small></div>{active.length > 0 ? <div className="quest-list">{active.map(({ progress, quest }) => <ActiveQuestCard key={quest.id} game={game} progress={progress} quest={quest} onAdvance={onAdvance} onAbandon={onAbandon} />)}</div> : <p className="quest-empty">前往地图上带有“任务”标记的地点，寻找可接取的委托。</p>}</section>
     {history.length > 0 && <section className="quest-group quest-history-group"><div className="quest-group-heading"><h3>已留在身后的故事</h3><small>最近记录</small></div><div className="quest-history-list">{history.map(({ progress, quest }) => <div className={`quest-history-row ${progress.status}`} key={`${quest.id}-${progress.finishedTurn}`}><span>{progress.status === "completed" ? <Check size={14} /> : <X size={14} />}</span><span>{quest.title}</span><small>{progress.status === "completed" ? "已完成" : progress.failureReason ?? "已结束"}</small></div>)}</div></section>}
@@ -900,11 +939,11 @@ function NpcDirectory({ game, onInteract, onToggleAttention }: { game: GameState
   return <section className="npc-directory side-section" aria-labelledby="npc-directory-title"><header className="directory-header"><div><span className="eyebrow">人物志</span><h2 id="npc-directory-title">与你有因果的人</h2></div><span className="directory-count"><Users size={16} />{special.length + attention.length} 人</span></header>{group("特殊关系", special, "尚未与任何人结下特殊关系。")}{group("特别关注", attention, "点击人物档案中的星标，记录你想持续留意的人。")}{deceased.length > 0 && group("已故人物", deceased, "")}{selectedNpc && <NpcDialog game={game} npc={selectedNpc} onClose={() => setSelectedNpcId(undefined)} onInteract={onInteract} onToggleAttention={onToggleAttention} />}</section>;
 }
 
-function PendingEvent({ game, onChoose, busy }: { game: GameState; onChoose: (choice: string) => void; busy?: boolean }) {
+function PendingEvent({ game, onChoose, onAiThink, aiAvailable, busy }: { game: GameState; onChoose: (choice: string) => void; onAiThink?: () => void; aiAvailable?: boolean; busy?: boolean }) {
   const event = getCurrentEvent(game);
   useEffect(() => {
-    if (event && event.choices.length === 0 && !game.eventResult && !busy) onChoose("");
-  }, [event?.id, game.eventResult, onChoose, busy]);
+    if (event && event.choices.length === 0 && !game.eventResult && !busy && !aiAvailable) onChoose("");
+  }, [event?.id, game.eventResult, onChoose, busy, aiAvailable]);
   if (!event) return null;
   return (
     <div className="modal-backdrop event-modal-backdrop" role="presentation">
@@ -916,6 +955,7 @@ function PendingEvent({ game, onChoose, busy }: { game: GameState; onChoose: (ch
       <span className="event-duration">处理此事预计耗时 {event.durationDays ?? 1} 天</span>
       <p id="pending-event-body">{event.body}</p>
       {busy && <p className="ai-working" role="status"><Bot size={16} />AI 正在裁定此事……</p>}
+      <div className="event-dialog-tools"><button className="secondary-command event-ai-think" type="button" disabled={Boolean(busy)} title={aiAvailable ? "让 AI 重构当前事件并提出新的可能" : "请先在设置中配置 AI"} onClick={onAiThink}><Sparkles size={16} />AI 思考</button>{!event.choices.length && aiAvailable && <button className="primary-command" type="button" disabled={Boolean(busy)} onClick={() => onChoose("")}><ChevronRight size={16} />按本地规则继续</button>}</div>
       <div className="choice-list">{event.choices.map((choice) => {
         const enabled = canChoose(game, choice);
         return <button key={choice.id} type="button" disabled={!enabled || Boolean(busy)} onClick={() => onChoose(choice.id)}><span><b>{choice.label}</b><small>{enabled ? choice.hint : "条件不足"}</small></span><ChevronRight size={18} /></button>;
@@ -925,7 +965,7 @@ function PendingEvent({ game, onChoose, busy }: { game: GameState; onChoose: (ch
   );
 }
 
-function PendingQuest({ game, onChoose, busy }: { game: GameState; onChoose: (choice: string) => void; busy?: boolean }) {
+function PendingQuest({ game, onChoose, onAiThink, aiAvailable, busy }: { game: GameState; onChoose: (choice: string) => void; onAiThink?: () => void; aiAvailable?: boolean; busy?: boolean }) {
   const current = getCurrentQuestStage(game);
   if (!current) return null;
   const { quest, progress, stage } = current;
@@ -939,6 +979,7 @@ function PendingQuest({ game, onChoose, busy }: { game: GameState; onChoose: (ch
       <p id="pending-quest-body">{stage.body}</p>
       {stage.objective && <p className="quest-encounter-objective"><Target size={15} />{stage.objective.description}</p>}
       {busy && <p className="ai-working" role="status"><Bot size={16} />AI 正在裁定此任务……</p>}
+      <div className="event-dialog-tools"><button className="secondary-command event-ai-think" type="button" disabled={Boolean(busy)} title={aiAvailable ? "让 AI 重构当前任务阶段及其选项" : "请先在设置中配置 AI"} onClick={onAiThink}><Sparkles size={16} />AI 思考</button></div>
       <div className="choice-list">{stage.choices?.length ? stage.choices.map((choice: QuestChoice) => {
         const enabled = canChoose(game, choice);
         return <button key={choice.id} type="button" disabled={!enabled || Boolean(busy)} onClick={() => onChoose(choice.id)}><span><b>{choice.label}</b><small>{enabled ? choice.hint : "条件不足"}</small></span><ChevronRight size={18} /></button>;
@@ -947,7 +988,7 @@ function PendingQuest({ game, onChoose, busy }: { game: GameState; onChoose: (ch
   </div>;
 }
 
-function EventResultDialog({ result, onClose }: { result: EventResult; onClose: () => void }) {
+function EventResultDialog({ game, result, onClose, onChoose, onAiThink, aiAvailable, busy }: { game: GameState; result: EventResult; onClose: () => void; onChoose: (choiceId: string) => void; onAiThink?: () => void; aiAvailable?: boolean; busy?: boolean }) {
   const generatedGroups = [
     { key: "locations", label: "地点", icon: MapPin, items: result.generatedContent?.locations ?? [] },
     { key: "npcs", label: "人物", icon: Users, items: result.generatedContent?.npcs ?? [] },
@@ -963,6 +1004,7 @@ function EventResultDialog({ result, onClose }: { result: EventResult; onClose: 
         <span className="eyebrow">{result.kind === "action" ? "行动结果" : result.kind === "quest" ? "任务结果" : "事件结果"}</span>
         <h2 id="event-result-title">{result.title}</h2>
         <span className="event-duration">{result.durationDays ? `本次耗时 ${result.durationDays} 天` : "即时操作"}</span>
+        {result.conversation && result.conversation.length > 0 && <div className="narrative-chat" aria-label="本次对话">{result.conversation.map((message, index) => <div className={`chat-message chat-${message.side}`} key={`${message.speaker}-${index}`}><span>{message.speaker}</span><p>{message.text}</p></div>)}</div>}
         <p id="event-result-text">{result.text}</p>
         {visibleGeneratedGroups.length > 0 && <div className="generated-content-summary" aria-label="本次新增因果">
           <span className="event-result-label">本次新增因果</span>
@@ -975,9 +1017,14 @@ function EventResultDialog({ result, onClose }: { result: EventResult; onClose: 
         </div>}
         <div className="event-result-changes" aria-label="属性变化">
           <span className="event-result-label">本次变化</span>
-          {result.changes.length > 0 ? result.changes.map((change) => <div className={`event-result-change ${change.amount > 0 ? "event-change-positive" : "event-change-negative"}`} key={`${change.label}-${change.amount}`}><span>{change.label}</span><strong>{change.amount > 0 ? `+${change.amount}` : change.amount}</strong></div>) : <p className="event-result-empty">没有可见的属性变化。</p>}
+          {result.changes.length > 0 ? result.changes.map((change, index) => <ResultChangeRow change={change} key={`${change.label}-${index}`} />) : <p className="event-result-empty">没有可见的属性变化。</p>}
         </div>
-        <button className="primary-command event-result-actions" type="button" onClick={onClose}><Check size={17} />继续</button>
+        {busy && <p className="ai-working" role="status"><Bot size={16} />AI 正在重构当前结果……</p>}
+        {result.choices?.length ? <div className="choice-list event-result-choice-list">{result.choices.map((choice) => {
+          const enabled = canChoose(game, choice);
+          return <button key={choice.id} type="button" disabled={!enabled || Boolean(busy)} onClick={() => onChoose(choice.id)}><span><b>{choice.label}</b><small>{enabled ? choice.hint : "条件不足"}</small></span><ChevronRight size={18} /></button>;
+        })}</div> : null}
+        <div className="event-dialog-tools event-result-actions"><button className="secondary-command event-ai-think" type="button" disabled={Boolean(busy)} title={aiAvailable ? "让 AI 重写当前结果并生成下一步分支" : "请先在设置中配置 AI"} onClick={onAiThink}><Sparkles size={16} />AI 思考</button><button className="primary-command" type="button" disabled={Boolean(busy)} onClick={onClose}><Check size={17} />继续</button></div>
       </section>
     </div>
   );
@@ -1018,7 +1065,7 @@ function ChronicleDetailDialog({ entry, onClose }: { entry: ChronicleEntry; onCl
         <p className="chronicle-detail-text" id="chronicle-detail-text">{entry.text}</p>
         <div className="event-result-changes chronicle-detail-changes" aria-label="属性变化">
           <span className="event-result-label">本次变化</span>
-          {entry.changes && entry.changes.length > 0 ? entry.changes.map((change) => <div className={`event-result-change ${change.amount > 0 ? "event-change-positive" : "event-change-negative"}`} key={`${change.label}-${change.amount}`}><span>{change.label}</span><strong>{change.amount > 0 ? `+${change.amount}` : change.amount}</strong></div>) : <p className="event-result-empty">没有记录到可见的属性变化。</p>}
+          {entry.changes && entry.changes.length > 0 ? entry.changes.map((change, index) => <ResultChangeRow change={change} key={`${change.label}-${index}`} />) : <p className="event-result-empty">没有记录到可见的属性变化。</p>}
         </div>
         <button className="primary-command chronicle-detail-close" type="button" onClick={onClose}><Check size={17} />返回历程</button>
       </section>
@@ -1158,7 +1205,7 @@ function SaveDialog({ game, meta, theme, onThemeChange, aiSettings, aiProfiles, 
   return (
     <div className="modal-backdrop" role="presentation" onMouseDown={(event) => { if (event.target === event.currentTarget) onClose(); }}>
       <section className="dialog save-dialog" role="dialog" aria-modal="true" aria-labelledby="save-title">
-        <header><div><span className="eyebrow">设置与卷宗</span><h2 id="save-title">存档与 AI 模式</h2></div><IconButton label="关闭" icon={X} onClick={onClose} /></header>
+        <header><div><span className="eyebrow">设置与卷宗</span><h2 id="save-title">存档与 AI 配置</h2></div><IconButton label="关闭" icon={X} onClick={onClose} /></header>
         <div className="save-options">
           <button type="button" onClick={download}><Download size={20} /><span><b>导出存档</b><small>保存本局与轮回见闻</small></span></button>
           <button type="button" onClick={() => fileRef.current?.click()}><Import size={20} /><span><b>导入存档</b><small>载入另一份 JSON 卷宗</small></span></button>
@@ -1177,8 +1224,8 @@ function SaveDialog({ game, meta, theme, onThemeChange, aiSettings, aiProfiles, 
           <label className="setting-field ai-profile-name-field"><span>档案名称</span><input value={draftProfileName} maxLength={32} onChange={(event) => setDraftProfileName(event.target.value)} placeholder="例如：本地长文模型" /></label>
         </section>
         <section className="ai-settings-section" aria-labelledby="ai-settings-title">
-          <header className="ai-settings-heading"><div><span className="eyebrow">可选叙事引擎</span><h3 id="ai-settings-title"><Bot size={17} />AI 模式</h3></div><label className="ai-toggle"><input type="checkbox" checked={draftAi.enabled} onChange={(event) => updateAi("enabled", event.target.checked)} /><span>{draftAi.enabled ? "已开启" : "已关闭"}</span></label></header>
-          <p className="settings-note">开启后，行动与事件会把当前角色、属性、地点和近期历程发送给配置的模型，由模型生成结果文案与属性变化。世界生成模式还可以让 AI 创作新的剧情、地点、任务链、事件、物品和 NPC。请求从浏览器直接发出，接口需允许跨域。</p>
+          <header className="ai-settings-heading"><div><span className="eyebrow">可选叙事引擎</span><h3 id="ai-settings-title"><Bot size={17} />AI 配置</h3></div></header>
+          <p className="settings-note">配置并保存后，在事件对话框使用“AI 思考”，或在行动列表选择“探索”调用 AI。世界生成可以在后台进行；接口需允许跨域。</p>
           <label className="setting-field"><span>API 格式</span><select value={draftAi.format} onChange={(event) => { const format = event.target.value as AiSettings["format"]; updateAi("format", format); setModels([]); }}><option value="openai">OpenAI 兼容格式</option><option value="claude">Claude Messages 格式</option></select></label>
           <label className="setting-field"><span>API 地址</span><input type="url" value={draftAi.endpoint} placeholder={draftAi.format === "openai" ? "https://api.openai.com/v1/chat/completions" : "https://api.anthropic.com/v1/messages"} onChange={(event) => updateAi("endpoint", event.target.value)} /></label>
           <label className="setting-field"><span>API Key</span><input type="password" autoComplete="off" value={draftAi.apiKey} placeholder="仅保存在本机浏览器" onChange={(event) => updateAi("apiKey", event.target.value)} /></label>
@@ -1204,6 +1251,10 @@ function GameScreen({ game, meta, theme, onThemeChange, aiSettings, onAiSettings
   const [aiBusy, setAiBusy] = useState(false);
   const [aiNotice, setAiNotice] = useState("");
   const aiBusyRef = useRef(false);
+  const gameRef = useRef(game);
+  const worldGeneratingRef = useRef(false);
+  const [worldGenerating, setWorldGenerating] = useState(false);
+  useEffect(() => { gameRef.current = game; }, [game]);
   const [isNarrow, setIsNarrow] = useState(() => typeof window !== "undefined" && window.innerWidth <= 720);
   useEffect(() => {
     const updateNarrow = () => setIsNarrow(window.innerWidth <= 720);
@@ -1217,42 +1268,28 @@ function GameScreen({ game, meta, theme, onThemeChange, aiSettings, onAiSettings
       onMeta(claimedResult.meta);
     }
   }, [claimedResult, game.legacyClaimed, onGame, onMeta]);
-  const shouldGenerateContent = (baseGame: GameState, trigger: AiQuestGenerationTrigger): boolean => {
-    if (!aiSettings.enabled || aiSettings.questGeneration !== "continuous" || baseGame.status !== "playing") return false;
-    const lastTurn = baseGame.aiContentLastTurn ?? -Infinity;
-    const elapsed = baseGame.turn - lastTurn;
-    const threshold = trigger.kind === "event" || trigger.kind === "quest" ? 2 : 5;
-    return lastTurn === -Infinity || elapsed >= threshold;
-  };
-  const generateContent = async (baseGame: GameState, trigger: AiQuestGenerationTrigger, announce: boolean): Promise<GameState> => {
-    if (aiBusyRef.current || !aiSettings.enabled || aiSettings.questGeneration === "off") return baseGame;
-    aiBusyRef.current = true;
-    setAiBusy(true);
+  const generateWorldInBackground = async (trigger: AiQuestGenerationTrigger) => {
+    if (worldGeneratingRef.current) return;
+    if (!isAiConfigured(aiSettings)) {
+      setAiNotice("请先在设置中配置 AI 档案");
+      return;
+    }
+    worldGeneratingRef.current = true;
+    setWorldGenerating(true);
     setAiNotice("");
     try {
-      if (!isAiConfigured(aiSettings)) throw new Error("AI 配置不完整");
-      const bundle = await requestAiContent(aiSettings, baseGame, trigger);
-      return addGeneratedContent(baseGame, bundle, announce);
+      const bundle = await requestAiContent(aiSettings, gameRef.current, trigger);
+      const latest = gameRef.current;
+      const next = addGeneratedContent(latest, bundle, !latest.eventResult);
+      gameRef.current = next;
+      onGame(next);
     } catch (error) {
-      console.error("[AI content generation]", error);
+      console.error("[AI background content generation]", error);
       setAiNotice(`AI 世界内容生成失败，已保留本地状态${error instanceof Error ? `：${error.message}` : ""}`);
-      return baseGame;
     } finally {
-      aiBusyRef.current = false;
-      setAiBusy(false);
+      worldGeneratingRef.current = false;
+      setWorldGenerating(false);
     }
-  };
-  const generateContinuousContent = async (baseGame: GameState, trigger: AiQuestGenerationTrigger): Promise<GameState> => {
-    if (!shouldGenerateContent(baseGame, trigger)) return baseGame;
-    return generateContent(baseGame, trigger, false);
-  };
-  const generateEventContent = async (baseGame: GameState, trigger: AiQuestGenerationTrigger): Promise<GameState> => {
-    // Event content generation is probability-driven and should also work in
-    // manual world-generation mode; "off" remains the explicit opt-out.
-    if (!aiSettings.enabled || aiSettings.questGeneration === "off" || baseGame.status !== "playing") return baseGame;
-    const rolled = rollAiContentChance(baseGame);
-    if (!rolled.shouldGenerate) return rolled.game;
-    return generateContent(rolled.game, trigger, false);
   };
   const contentTrigger = (kind: AiQuestGenerationTrigger["kind"], title: string, text: string, baseGame: GameState): AiQuestGenerationTrigger => ({
     kind,
@@ -1265,10 +1302,6 @@ function GameScreen({ game, meta, theme, onThemeChange, aiSettings, onAiSettings
     const next = acceptQuest(game, questId);
     if (next === game) return;
     onGame(next);
-    const quest = getQuestDefinition(next, questId);
-    void generateContinuousContent(next, contentTrigger("quest", quest?.title ?? "接受任务", quest?.summary ?? "一条新的任务线索进入了你的生命。", next)).then((generatedNext) => {
-      if (generatedNext !== next) onGame(generatedNext);
-    });
   };
   const advanceQuestAction = (questId: string) => {
     if (aiBusyRef.current) return;
@@ -1276,10 +1309,6 @@ function GameScreen({ game, meta, theme, onThemeChange, aiSettings, onAiSettings
     if (next === game) return;
     onGame(next);
     if (next.pendingQuestId) setTab(tab === "quests" ? "quests" : "map");
-    const quest = getQuestDefinition(next, questId);
-    void generateContinuousContent(next, contentTrigger("quest", quest?.title ?? "推进任务", quest?.summary ?? "任务的下一段因果正在浮现。", next)).then((generatedNext) => {
-      if (generatedNext !== next) onGame(generatedNext);
-    });
   };
   const abandonQuestAction = (questId: string) => {
     if (aiBusyRef.current) return;
@@ -1292,16 +1321,19 @@ function GameScreen({ game, meta, theme, onThemeChange, aiSettings, onAiSettings
     if (aiBusyRef.current) return;
     const definition = ACTIONS.find((item) => item.id === id);
     const requestedDays = durationDays ?? definition?.durationDays ?? 1;
-    const useAi = aiSettings.enabled;
+    const useAi = id === "explore" && isAiConfigured(aiSettings);
     let next: GameState;
     if (useAi) {
       aiBusyRef.current = true;
       setAiBusy(true);
       setAiNotice("");
       try {
-        if (!isAiConfigured(aiSettings) || !definition) throw new Error("AI 配置不完整");
-        const generated = await requestAiAction(aiSettings, game, definition, requestedDays);
-        next = performActionWithAi(game, id, requestedDays, generated);
+        if (!definition) throw new Error("行动定义不存在");
+        const rolled = rollAiContentChance(game);
+        const allowDerivativeContent = rolled.shouldGenerate && aiSettings.questGeneration !== "off";
+        const generated = await requestAiExplore(aiSettings, rolled.game, allowDerivativeContent);
+        const contentReadyGame = generated.generatedContent ? addGeneratedContent(rolled.game, generated.generatedContent, false) : rolled.game;
+        next = performActionWithAi(contentReadyGame, id, requestedDays, generated);
       } catch (error) {
         next = performAction(game, id, requestedDays);
         setAiNotice(`AI 未能完成本次裁定，已使用本地规则${error instanceof Error ? `：${error.message}` : ""}`);
@@ -1318,8 +1350,6 @@ function GameScreen({ game, meta, theme, onThemeChange, aiSettings, onAiSettings
     const nextTab = next.pendingEventId ? "map" : tab === "map" ? "map" : tab === "actions" ? "actions" : "journey";
     setTab(nextTab);
     window.scrollTo({ top: 0, behavior: "smooth" });
-    const generatedNext = await generateContinuousContent(next, contentTrigger("action", definition?.name ?? id, "这次行动为之后的因果留下了新的空白。", next));
-    if (generatedNext !== next) onGame(generatedNext);
   };
   const openMarket = () => {
     if (aiBusyRef.current) return;
@@ -1330,62 +1360,44 @@ function GameScreen({ game, meta, theme, onThemeChange, aiSettings, onAiSettings
   // This also prevents a rerender or result dialog from falling back to the chronicle tab.
   const travel = async (locationId: string) => {
     if (aiBusyRef.current) return;
-    const target = game.world.locations.find((location) => location.id === locationId);
-    let next: GameState;
-    if (aiSettings.enabled && target && canTravel(game, locationId).allowed) {
-      aiBusyRef.current = true;
-      setAiBusy(true);
-      setAiNotice("");
-      try {
-        if (!isAiConfigured(aiSettings)) throw new Error("AI 配置不完整");
-        const generated = await requestAiTravel(aiSettings, game, target);
-        next = travelToWithAi(game, locationId, generated);
-      } catch (error) {
-        next = travelTo(game, locationId);
-        setAiNotice(`AI 未能完成行途裁定，已使用本地规则${error instanceof Error ? `：${error.message}` : ""}`);
-      } finally {
-        aiBusyRef.current = false;
-        setAiBusy(false);
-      }
-    } else {
-      next = travelTo(game, locationId);
-    }
+    const next = travelTo(game, locationId);
     if (next === game) return;
     onGame(next);
     setShowActions(false);
     setTab("map");
     window.scrollTo({ top: 0, behavior: "smooth" });
-    const generatedNext = await generateContinuousContent(next, contentTrigger("travel", target?.name ?? "前往新地点", "你沿着地图上的路径继续前行，远方似乎还有新的故事等待展开。", next));
-    if (generatedNext !== next) onGame(generatedNext);
   };
   const choose = async (id: string) => {
     if (aiBusyRef.current) return;
-    const event = getCurrentEvent(game);
-    if (!event) return;
-    let next: GameState;
-    if (aiSettings.enabled) {
-      aiBusyRef.current = true;
-      setAiBusy(true);
-      setAiNotice("");
-      try {
-        if (!isAiConfigured(aiSettings)) throw new Error("AI 配置不完整");
-        const choice = event.choices.find((item) => item.id === id);
-        const generated = await requestAiEvent(aiSettings, game, event, choice);
-        next = resolveEventWithAi(game, id, generated);
-      } catch (error) {
-        next = resolveEvent(game, id);
-        setAiNotice(`AI 未能完成事件裁定，已使用本地规则${error instanceof Error ? `：${error.message}` : ""}`);
-      } finally {
-        aiBusyRef.current = false;
-        setAiBusy(false);
-      }
-    } else {
-      next = resolveEvent(game, id);
-    }
+    if (!getCurrentEvent(game)) return;
+    const next = resolveEvent(game, id);
     if (next === game) return;
     onGame(next);
-    const generatedNext = await generateEventContent(next, contentTrigger("event", event.title, event.body, next));
-    if (generatedNext !== next) onGame(generatedNext);
+  };
+  const thinkEvent = async () => {
+    if (aiBusyRef.current) return;
+    const event = getCurrentEvent(game);
+    if (!event) return;
+    if (!isAiConfigured(aiSettings)) {
+      setAiNotice("请先在设置中配置 AI 档案");
+      return;
+    }
+    const rolled = rollAiContentChance(game);
+    aiBusyRef.current = true;
+    setAiBusy(true);
+    setAiNotice("");
+    try {
+      const rewrite = await requestAiEventRewrite(aiSettings, rolled.game, event, rolled.shouldGenerate && aiSettings.questGeneration !== "off");
+      let next = rewritePendingEvent(rolled.game, rewrite);
+      if (rolled.shouldGenerate && rewrite.generatedContent) next = addGeneratedContent(next, rewrite.generatedContent, false);
+      gameRef.current = next;
+      onGame(next);
+    } catch (error) {
+      setAiNotice(`AI 未能重构此事${error instanceof Error ? `：${error.message}` : ""}`);
+    } finally {
+      aiBusyRef.current = false;
+      setAiBusy(false);
+    }
   };
   const chooseQuest = async (id: string) => {
     if (aiBusyRef.current) return;
@@ -1394,59 +1406,70 @@ function GameScreen({ game, meta, theme, onThemeChange, aiSettings, onAiSettings
     const choice = currentQuest.stage.choices?.find((candidate) => candidate.id === id);
     const continueWithoutChoice = id === "__continue__" && !currentQuest.stage.choices?.length;
     if (!choice && !continueWithoutChoice) return;
-    let next: GameState;
-    if (aiSettings.enabled) {
-      aiBusyRef.current = true;
-      setAiBusy(true);
-      setAiNotice("");
-      try {
-        if (!isAiConfigured(aiSettings)) throw new Error("AI 配置不完整");
-        const generated = await requestAiQuest(aiSettings, game, currentQuest.quest, currentQuest.stage, choice);
-        next = resolveQuestStageWithAi(game, id, generated);
-      } catch (error) {
-        next = resolveQuestStage(game, id);
-        setAiNotice(`AI 未能完成任务裁定，已使用本地规则${error instanceof Error ? `：${error.message}` : ""}`);
-      } finally {
-        aiBusyRef.current = false;
-        setAiBusy(false);
-      }
-    } else {
-      next = resolveQuestStage(game, id);
-    }
+    const next = resolveQuestStage(game, id);
     if (next === game) return;
     onGame(next);
-    const generatedNext = await generateContinuousContent(next, contentTrigger("quest", currentQuest.quest.title, currentQuest.stage.body, next));
-    if (generatedNext !== next) onGame(generatedNext);
+  };
+  const thinkQuest = async () => {
+    if (aiBusyRef.current) return;
+    const current = getCurrentQuestStage(game);
+    if (!current) return;
+    if (!isAiConfigured(aiSettings)) {
+      setAiNotice("请先在设置中配置 AI 档案");
+      return;
+    }
+    const rolled = rollAiContentChance(game);
+    aiBusyRef.current = true;
+    setAiBusy(true);
+    setAiNotice("");
+    try {
+      const rewrite = await requestAiQuestStageRewrite(aiSettings, rolled.game, current.quest, current.stage, rolled.shouldGenerate && aiSettings.questGeneration !== "off");
+      let next = rewritePendingQuestStage(rolled.game, rewrite);
+      if (rewrite.generatedContent) next = addGeneratedContent(next, rewrite.generatedContent, false);
+      gameRef.current = next;
+      onGame(next);
+    } catch (error) {
+      setAiNotice(`AI 未能重构当前任务阶段${error instanceof Error ? `：${error.message}` : ""}`);
+    } finally {
+      aiBusyRef.current = false;
+      setAiBusy(false);
+    }
+  };
+  const thinkResult = async () => {
+    if (aiBusyRef.current || !game.eventResult) return;
+    if (!isAiConfigured(aiSettings)) {
+      setAiNotice("请先在设置中配置 AI 档案");
+      return;
+    }
+    const rolled = rollAiContentChance(game);
+    aiBusyRef.current = true;
+    setAiBusy(true);
+    setAiNotice("");
+    try {
+      const rewrite = await requestAiResultRewrite(aiSettings, rolled.game, game.eventResult, rolled.shouldGenerate && aiSettings.questGeneration !== "off");
+      let next = rewriteEventResult(rolled.game, rewrite);
+      if (rewrite.generatedContent) next = addGeneratedContent(next, rewrite.generatedContent, false);
+      gameRef.current = next;
+      onGame(next);
+    } catch (error) {
+      setAiNotice(`AI 未能重构当前结果${error instanceof Error ? `：${error.message}` : ""}`);
+    } finally {
+      aiBusyRef.current = false;
+      setAiBusy(false);
+    }
+  };
+  const chooseResult = (choiceId: string) => {
+    if (aiBusyRef.current) return;
+    const next = resolveEventResultChoice(game, choiceId);
+    if (next !== game) onGame(next);
   };
   const npcInteraction = async (npcId: string, interactionId: NpcInteractionId) => {
     if (aiBusyRef.current) return;
-    const npc = game.npcs.find((item) => item.id === npcId);
-    const interaction = NPC_INTERACTIONS.find((item) => item.id === interactionId);
-    let next: GameState;
-    if (aiSettings.enabled && npc && interaction && canInteractWithNpc(game, npcId, interactionId).allowed) {
-      aiBusyRef.current = true;
-      setAiBusy(true);
-      setAiNotice("");
-      try {
-        if (!isAiConfigured(aiSettings)) throw new Error("AI 配置不完整");
-        const generated = await requestAiNpcInteraction(aiSettings, game, npc, interaction);
-        next = interactWithNpcWithAi(game, npcId, interactionId, generated);
-      } catch (error) {
-        next = interactWithNpc(game, npcId, interactionId);
-        setAiNotice(`AI 未能完成交往裁定，已使用本地规则${error instanceof Error ? `：${error.message}` : ""}`);
-      } finally {
-        aiBusyRef.current = false;
-        setAiBusy(false);
-      }
-    } else {
-      next = interactWithNpc(game, npcId, interactionId);
-    }
+    const next = interactWithNpc(game, npcId, interactionId);
     if (next === game) return;
     onGame(next);
     // Keep the map visible when the interaction was started from the map sidebar.
     setTab(tab === "map" || tab === "npcs" ? tab : "actions");
-    const generatedNext = await generateContinuousContent(next, contentTrigger("npc", `${npc?.name ?? "NPC"} ${interaction?.name ?? "互动"}`, "一段新的交往正在改变彼此的命运。", next));
-    if (generatedNext !== next) onGame(generatedNext);
   };
   const toggleAttention = (npcId: string) => onGame(toggleNpcAttention(game, npcId));
   const itemUse = (itemId: string) => {
@@ -1485,7 +1508,7 @@ function GameScreen({ game, meta, theme, onThemeChange, aiSettings, onAiSettings
   }
   return (
     <main className="game-shell">
-      <header className="game-header"><button className="brand-button" type="button" onClick={onHome}><Brand /></button><div className="turn-marker"><span>第 {game.turn} 天</span><i /><span>{REALMS[game.realmStage - 1]}</span><i /><span>{getCurrentLocation(game).name}</span></div><div className="header-tools"><label className={`header-ai-toggle ${aiSettings.enabled ? "active" : ""}`} title={aiSettings.enabled ? "关闭 AI 模式" : "开启 AI 模式"}><Bot size={16} /><span>AI</span><input type="checkbox" checked={aiSettings.enabled} onChange={(event) => onAiSettingsChange({ ...aiSettings, enabled: event.target.checked })} /><span className="header-ai-switch" aria-hidden="true"><span /></span></label><IconButton label={theme === "dark" ? "切换浅色主题" : "切换深色主题"} icon={theme === "dark" ? Sun : Moon} onClick={() => onThemeChange(theme === "dark" ? "light" : "dark")} /><IconButton label="设置" icon={Settings} onClick={onManage} /><IconButton label="本次模拟详情" icon={Info} onClick={() => setShowDetails(true)} /><IconButton label="返回山门" icon={Menu} onClick={onHome} /></div></header>
+      <header className="game-header"><button className="brand-button" type="button" onClick={onHome}><Brand /></button><div className="turn-marker"><span>第 {game.turn} 天</span><i /><span>{REALMS[game.realmStage - 1]}</span><i /><span>{getCurrentLocation(game).name}</span></div><div className="header-tools"><IconButton label={theme === "dark" ? "切换浅色主题" : "切换深色主题"} icon={theme === "dark" ? Sun : Moon} onClick={() => onThemeChange(theme === "dark" ? "light" : "dark")} /><IconButton label="设置" icon={Settings} onClick={onManage} /><IconButton label="本次模拟详情" icon={Info} onClick={() => setShowDetails(true)} /><IconButton label="返回山门" icon={Menu} onClick={onHome} /></div></header>
       <div className="desktop-layout">
         <aside className="left-sidebar"><StatPanel game={game} /></aside>
         <div className="center-column">
@@ -1493,7 +1516,7 @@ function GameScreen({ game, meta, theme, onThemeChange, aiSettings, onAiSettings
           <div className={`center-panel ${tab === "journey" ? "active" : ""}`}><div className="mobile-status-strip"><span>第 {game.turn} 天</span><span><Heart size={14} />{Math.round(game.resources.stamina)}</span><span><Swords size={14} />{Math.round(game.resources.battlePower)}</span><span><Sparkles size={14} />{Math.round(game.resources.cultivation)}/{game.resources.cultivationRequired}</span></div><Chronicle game={game} /></div>
           <div className={`center-panel ${tab === "map" ? "active" : ""}`}><WorldMap game={game} onTravel={travel} onAction={action} onMarket={openMarket} onBreakthrough={() => setShowBreakthrough(true)} onAcceptQuest={acceptQuestAction} onAdvanceQuest={advanceQuestAction} showActions={showActions} onShowActionsChange={setShowActions} /></div>
           <div className={`center-panel ${tab === "npcs" ? "active" : ""}`}><NpcDirectory game={game} onInteract={npcInteraction} onToggleAttention={toggleAttention} /></div>
-          <div className={`center-panel ${tab === "quests" ? "active" : ""}`}><QuestPanel game={game} onAccept={acceptQuestAction} onAdvance={advanceQuestAction} onAbandon={abandonQuestAction} aiGenerationEnabled={aiSettings.enabled && aiSettings.questGeneration !== "off"} aiGenerating={aiBusy} onGenerateContent={() => { void generateContent(game, contentTrigger("manual", "主动开拓世界", "请根据当前人生继续创造新的因果。", game), true).then((next) => { if (next !== game) onGame(next); }); }} /></div>
+          <div className={`center-panel ${tab === "quests" ? "active" : ""}`}><QuestPanel game={game} onAccept={acceptQuestAction} onAdvance={advanceQuestAction} onAbandon={abandonQuestAction} aiGenerationEnabled={isAiConfigured(aiSettings) && aiSettings.questGeneration !== "off"} aiGenerating={worldGenerating} onGenerateContent={() => { void generateWorldInBackground(contentTrigger("manual", "主动开拓世界", "请根据当前人生继续创造新的因果。", game)); }} /></div>
           <div className={`center-panel ${tab === "inventory" ? "active" : ""}`}><InventoryPanel game={game} onUseItem={itemUse} onGiftItem={setGiftItemId} /></div>
         </div>
         <aside className="right-sidebar">{!showActions && <ActionSidebar game={game} onAction={action} onMarket={openMarket} onBreakthrough={() => setShowBreakthrough(true)} onAcceptQuest={acceptQuestAction} onAdvanceQuest={advanceQuestAction} onNpcInteraction={npcInteraction} onToggleAttention={toggleAttention} />}</aside>
@@ -1502,13 +1525,13 @@ function GameScreen({ game, meta, theme, onThemeChange, aiSettings, onAiSettings
         {isNarrow && !showActions && <div className={`mobile-only-panel ${tab === "actions" ? "active" : ""}`}><ActionSidebar game={game} onAction={action} onMarket={openMarket} onBreakthrough={() => setShowBreakthrough(true)} onAcceptQuest={acceptQuestAction} onAdvanceQuest={advanceQuestAction} onNpcInteraction={npcInteraction} onToggleAttention={toggleAttention} /></div>}
         <div className={`mobile-only-panel ${tab === "legacy" ? "active" : ""}`}><GoalPanel game={game} /><LegacyPanel meta={meta} /></div>
       </div>
-      {(aiBusy || aiNotice) && <div className={`ai-status ${aiBusy ? "working" : "notice"}`} role="status">{aiBusy ? <><Bot size={15} />AI 正在处理当前叙事……</> : <><Bot size={15} />{aiNotice}</>}</div>}
+      {(aiBusy || worldGenerating || aiNotice) && <div className={`ai-status ${aiBusy || worldGenerating ? "working" : "notice"}`} role="status">{aiBusy ? <><Bot size={15} />AI 正在处理当前叙事……</> : worldGenerating ? <><Bot size={15} />天机正在拓展世界，你仍可继续行动……</> : <><Bot size={15} />{aiNotice}</>}</div>}
       <nav className="mobile-nav" aria-label="主要视图">
         {([{ id: "journey", icon: ScrollText, label: "历程" }, { id: "map", icon: MapIcon, label: "舆图" }, { id: "npcs", icon: Users, label: "人物志" }, { id: "quests", icon: ListChecks, label: "任务" }, { id: "actions", icon: ListChecks, label: "行动" }, { id: "inventory", icon: Backpack, label: "物品栏" }, { id: "character", icon: UserRound, label: "人物" }, { id: "legacy", icon: History, label: "详情" }] as const).map(({ id, icon: Icon, label }) => <button key={id} type="button" className={tab === id ? "active" : ""} onClick={() => setTab(id)}><Icon size={20} /><span>{label}</span></button>)}
       </nav>
-      {game.pendingEventId && <PendingEvent game={game} onChoose={choose} busy={aiBusy} />}
-      {game.pendingQuestId && <PendingQuest game={game} onChoose={chooseQuest} busy={aiBusy} />}
-      {game.eventResult && <EventResultDialog result={game.eventResult} onClose={() => onGame(dismissEventResult(game))} />}
+      {game.pendingEventId && <PendingEvent game={game} onChoose={choose} onAiThink={thinkEvent} aiAvailable={isAiConfigured(aiSettings)} busy={aiBusy} />}
+      {game.pendingQuestId && <PendingQuest game={game} onChoose={chooseQuest} onAiThink={thinkQuest} aiAvailable={isAiConfigured(aiSettings)} busy={aiBusy} />}
+      {game.eventResult && <EventResultDialog game={game} result={game.eventResult} onClose={() => onGame(dismissEventResult(game))} onChoose={chooseResult} onAiThink={thinkResult} aiAvailable={isAiConfigured(aiSettings)} busy={aiBusy} />}
       {aiBusy && <AiWorkingDialog />}
       {showBreakthrough && <BreakthroughDialog game={game} onClose={() => setShowBreakthrough(false)} onConfirm={commitBreakthrough} />}
       {showDetails && <SimulationDetailsDialog game={game} meta={meta} onClose={() => setShowDetails(false)} />}

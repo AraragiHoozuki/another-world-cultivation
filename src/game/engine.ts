@@ -4,6 +4,9 @@ import type {
   AiGeneratedContentBundle,
   AiGeneratedLocationDraft,
   AiGeneratedOutcome,
+  AiEventRewrite,
+  AiQuestStageRewrite,
+  AiResultRewrite,
   CharacterCandidate,
   CharacterGender,
   ChronicleEntry,
@@ -21,6 +24,7 @@ import type {
   LocationRole,
   LocationModifiers,
   MetaProgress,
+  NarrativeMessage,
   Npc,
   NpcGender,
   NpcInteractionId,
@@ -34,6 +38,7 @@ import type {
   ResourceKey,
   Resources,
   RunSummary,
+  StatusEffect,
   Tone,
   TraitDefinition,
   TraitRarity,
@@ -502,7 +507,7 @@ export function startGame(candidate: CharacterCandidate, name: string, seed: num
 }
 
 function hasPendingNarrative(game: GameState): boolean {
-  return Boolean(game.pendingEventId || game.pendingQuestId || game.pendingEventQueue?.length);
+  return Boolean(game.pendingEventId || game.pendingQuestId || game.pendingEventQueue?.length || game.pendingEventDraftQueue?.length);
 }
 
 function queuePendingEvent(game: GameState, eventId: string): GameState {
@@ -514,7 +519,17 @@ function queuePendingEvent(game: GameState, eventId: string): GameState {
 }
 
 function promotePendingEvent(game: GameState): GameState {
-  if (game.pendingEventId || !game.pendingEventQueue?.length) return game;
+  if (game.pendingEventId) return game;
+  if (game.pendingEventDraftQueue?.length) {
+    const [draft, ...remaining] = game.pendingEventDraftQueue;
+    return {
+      ...game,
+      pendingEventId: draft.id,
+      pendingEventDraft: draft,
+      pendingEventDraftQueue: remaining.length ? remaining : undefined,
+    };
+  }
+  if (!game.pendingEventQueue?.length) return game;
   const [pendingEventId, ...remaining] = game.pendingEventQueue;
   return { ...game, pendingEventId, pendingEventQueue: remaining.length ? remaining : undefined };
 }
@@ -555,6 +570,34 @@ function effectiveStats(game: GameState): CoreStats {
   return game.statuses.reduce((stats, status) => addPartial(stats, status.stats), { ...game.character.stats });
 }
 
+function applyPermanentTrait(game: GameState, trait: TraitDefinition): GameState {
+  if (game.character.traits.some((existing) => existing.id === trait.id)) return game;
+  let next: GameState = {
+    ...game,
+    character: {
+      ...game.character,
+      stats: addPartial(game.character.stats, trait.stats),
+      traits: [...game.character.traits, { ...trait }],
+      spiritRoot: {
+        ...game.character.spiritRoot,
+        cultivationBonus: game.character.spiritRoot.cultivationBonus + (trait.cultivationBonus ?? 0),
+        alchemyBonus: (game.character.spiritRoot.alchemyBonus ?? 0) + (trait.alchemyBonus ?? 0),
+        explorationBonus: (game.character.spiritRoot.explorationBonus ?? 0) + (trait.explorationBonus ?? 0),
+      },
+      talent: {
+        ...game.character.talent,
+        dangerModifier: (game.character.talent.dangerModifier ?? 0) + (trait.dangerModifier ?? 0),
+      },
+    },
+    resources: addPartial(game.resources, trait.resources),
+  };
+  next.resources.maxStamina = Math.max(1, next.resources.maxStamina);
+  next.resources.maxHealth = next.resources.maxStamina;
+  next.resources.maxQi = Math.max(1, next.resources.maxQi);
+  next.resources.maxMind = Math.max(1, next.resources.maxMind);
+  return next;
+}
+
 function clampResources(resources: Resources): Resources {
   const stamina = Math.max(0, Math.min(resources.maxStamina, resources.stamina));
   return {
@@ -572,7 +615,7 @@ function clampResources(resources: Resources): Resources {
 }
 
 function applyEffects(game: GameState, effects: Effect[]): GameState {
-  let next: GameState = { ...game, resources: { ...game.resources }, character: { ...game.character, stats: { ...game.character.stats } }, statuses: [...game.statuses], flags: [...game.flags], inventory: [...(game.inventory ?? [])] };
+  let next: GameState = { ...game, resources: { ...game.resources }, character: { ...game.character, stats: { ...game.character.stats }, traits: [...game.character.traits] }, statuses: [...game.statuses], flags: [...game.flags], inventory: [...(game.inventory ?? [])] };
   effects.forEach((effect) => {
     if (effect.type === "resource") {
       if (effect.key === "health" || effect.key === "stamina") {
@@ -584,6 +627,26 @@ function applyEffects(game: GameState, effects: Effect[]): GameState {
       }
     }
     if (effect.type === "stat") next.character.stats[effect.key] = Math.max(1, next.character.stats[effect.key] + effect.amount);
+    if (effect.type === "item" && itemDefinitionFor(next, effect.itemId)) next = changeInventory(next, effect.itemId, effect.amount);
+    if (effect.type === "trait") {
+      if (effect.durationDays && effect.durationDays > 0) {
+        const status: StatusEffect = {
+          id: `trait-${effect.trait.id}`,
+          name: effect.trait.name,
+          description: effect.trait.description,
+          remaining: Math.max(1, Math.round(effect.durationDays)),
+          rarity: effect.trait.rarity,
+          stats: effect.trait.stats,
+          cultivationBonus: effect.trait.cultivationBonus,
+          alchemyBonus: effect.trait.alchemyBonus,
+          explorationBonus: effect.trait.explorationBonus,
+          dangerModifier: effect.trait.dangerModifier,
+        };
+        next.statuses = [...next.statuses.filter((current) => current.id !== status.id), status];
+      } else {
+        next = applyPermanentTrait(next, effect.trait);
+      }
+    }
     if (effect.type === "status") next.statuses = [...next.statuses.filter((status) => status.id !== effect.status.id), { ...effect.status }];
     if (effect.type === "flag" && !next.flags.includes(effect.key)) next.flags.push(effect.key);
   });
@@ -617,13 +680,13 @@ function resourceQuantity(game: GameState, key: ResourceKey): number {
 }
 
 function itemChange(item: ItemDefinition, amount: number): EventResultChange {
-  return { label: item.name, amount };
+  return { label: item.name, amount, itemRarity: item.rarity };
 }
 
 function itemActionResult(before: GameState, after: GameState, title: string, text: string, tone: Tone, durationDays = 0): GameState {
   const changes = eventChanges(before, after);
   let next = addLog(after, title, text, tone, { kind: "action", locationName: getCurrentLocation(before).name, changes, durationDays });
-  next = { ...next, eventResult: { kind: "action", title, text, tone, changes, durationDays } };
+  next = resultWithPendingGeneratedContent(next, { kind: "action", title, text, tone, changes, durationDays });
   return checkEnding(next);
 }
 
@@ -739,7 +802,7 @@ export function giftItem(game: GameState, npcId: string, itemId: string, quantit
   const title = `赠送${item.name}`;
   const text = `你将${item.name}赠给${npc.name}，这份心意让彼此的因果又近了一步。`;
   next = addLog(next, title, text, "good", { kind: "action", locationName: getCurrentLocation(before).name, changes, detail: `赠予${npc.name}`, durationDays: 1 });
-  next = { ...next, eventResult: { kind: "action", title, text, tone: "good", changes, durationDays: 1 } };
+  next = resultWithPendingGeneratedContent(next, { kind: "action", title, text, tone: "good", changes, durationDays: 1 });
   return checkEnding(next);
 }
 
@@ -794,11 +857,29 @@ function eventChanges(before: GameState, after: GameState): EventResultChange[] 
     const amount = after.character.stats[key] - before.character.stats[key];
     if (amount !== 0) changes.push({ label: eventStatLabels[key], amount });
   });
+  const beforeTraits = new Set(before.character.traits.map((trait) => trait.id));
+  after.character.traits.forEach((trait) => {
+    if (!beforeTraits.has(trait.id)) changes.push({ label: `永久词条 · ${trait.name}`, amount: 1, trait });
+  });
+  const beforeStatuses = new Set(before.statuses.map((status) => status.id));
+  after.statuses.forEach((status) => {
+    if (!beforeStatuses.has(status.id)) changes.push({ label: `临时词条 · ${status.name}`, amount: status.remaining, trait: status, remainingDays: status.remaining });
+  });
   return changes;
 }
 
-function withResult(before: GameState, after: GameState, title: string, text: string, tone: Tone, kind: EventResult["kind"] = "action", durationDays = 1): GameState {
-  return { ...after, eventResult: { kind, title, text, tone, changes: eventChanges(before, after), durationDays } };
+function withResult(before: GameState, after: GameState, title: string, text: string, tone: Tone, kind: EventResult["kind"] = "action", durationDays = 1, conversation?: NarrativeMessage[]): GameState {
+  const generatedContent = after.pendingGeneratedContent;
+  return {
+    ...after,
+    pendingGeneratedContent: undefined,
+    eventResult: { kind, title, text, tone, changes: eventChanges(before, after), durationDays, ...(conversation?.length ? { conversation } : {}), ...(generatedContent ? { generatedContent } : {}) },
+  };
+}
+
+function resultWithPendingGeneratedContent(game: GameState, result: EventResult): GameState {
+  const generatedContent = game.pendingGeneratedContent;
+  return { ...game, pendingGeneratedContent: undefined, eventResult: { ...result, ...(generatedContent ? { generatedContent } : {}) } };
 }
 
 function addLog(game: GameState, title: string, text: string, tone: Tone = "neutral", details: Pick<ChronicleEntry, "kind" | "detail" | "locationName" | "changes" | "durationDays"> = {}): GameState {
@@ -964,7 +1045,8 @@ function actionOutcome(game: GameState, actionId: ActionId, durationDays: number
     return [next, `你运转周天，炼化异界灵气，修为增长 ${gain}。`, "mystic"];
   }
   if (actionId === "explore") {
-    const stones = Math.max(2, Math.round((3 + roll * 8 + stats.fortune * 0.6 + (root.explorationBonus ?? 0) * 10) * (1 + actionBonus)));
+    const statusBonus = next.statuses.reduce((sum, status) => sum + (status.explorationBonus ?? 0), 0);
+    const stones = Math.max(2, Math.round((3 + roll * 8 + stats.fortune * 0.6 + ((root.explorationBonus ?? 0) + statusBonus) * 10) * (1 + actionBonus)));
     next = applyEffects(next, [{ type: "resource", key: "qi", amount: -6 }, { type: "resource", key: "spiritStones", amount: stones }]);
     const foundItemId = roll > 0.82 ? "cloud-silk" : roll > 0.62 ? "spirit-iron" : undefined;
     if (foundItemId) next = changeInventory(next, foundItemId, 1);
@@ -977,7 +1059,8 @@ function actionOutcome(game: GameState, actionId: ActionId, durationDays: number
     return [next, `你辨得药性，采回 ${herbs} 株可用灵草。`, "good"];
   }
   if (actionId === "alchemy") {
-    const chance = Math.min(0.9, 0.42 + stats.spirit * 0.045 + (root.alchemyBonus ?? 0) + (talent.id === "alchemist" ? 0.15 : 0) + actionBonus);
+    const statusBonus = next.statuses.reduce((sum, status) => sum + (status.alchemyBonus ?? 0), 0);
+    const chance = Math.min(0.9, 0.42 + stats.spirit * 0.045 + (root.alchemyBonus ?? 0) + statusBonus + (talent.id === "alchemist" ? 0.15 : 0) + actionBonus);
     const success = roll < chance;
     next = applyEffects(next, [{ type: "resource", key: "herbs", amount: -2 }, ...(success ? [{ type: "resource", key: "pills", amount: 1 } as Effect] : [{ type: "resource", key: "mind", amount: -4 } as Effect])]);
     return success
@@ -996,7 +1079,7 @@ function actionOutcome(game: GameState, actionId: ActionId, durationDays: number
 
 function finishAction(game: GameState, actionId: ActionId, durationDays: number, generated?: AiGeneratedOutcome): GameState {
   const action = ACTIONS.find((item) => item.id === actionId)!;
-  let next = tick({ ...game, pendingEventId: undefined, pendingQuestId: undefined }, durationDays);
+  let next = tick({ ...game, pendingEventId: undefined, pendingEventDraft: undefined, pendingEventDraftQueue: undefined, pendingQuestId: undefined, pendingQuestDraft: undefined }, durationDays);
   let message: string;
   let tone: Tone;
   let title = action.name;
@@ -1021,7 +1104,7 @@ function finishAction(game: GameState, actionId: ActionId, durationDays: number,
       }
     }
   }
-  next = withResult(game, next, title, message, tone, "action", durationDays);
+  next = withResult(game, next, title, message, tone, "action", durationDays, generated?.conversation);
   return checkEnding(next);
 }
 
@@ -1283,6 +1366,18 @@ export function addGeneratedContent(game: GameState, bundle: AiGeneratedContentB
         },
       },
     };
+  } else if (!announce) {
+    const previous = next.pendingGeneratedContent;
+    next = {
+      ...next,
+      pendingGeneratedContent: {
+        locations: [...(previous?.locations ?? []), ...generatedContent.locations],
+        npcs: [...(previous?.npcs ?? []), ...generatedContent.npcs],
+        quests: [...(previous?.quests ?? []), ...generatedContent.quests],
+        events: [...(previous?.events ?? []), ...generatedContent.events],
+        items: [...(previous?.items ?? []), ...generatedContent.items],
+      },
+    };
   }
   return refreshQuestOffers(next, 1, false);
 }
@@ -1295,7 +1390,7 @@ export function initializeQuestSystem(game: GameState): GameState {
   const quests = rawQuests.filter((progress) => progress && typeof progress.questId === "string" && knownQuestIds.has(progress.questId));
   const offers = rawOffers.filter((offer) => offer && typeof offer.questId === "string" && knownQuestIds.has(offer.questId));
   const pendingQuestId = typeof game.pendingQuestId === "string" && quests.some((progress) => progress.questId === game.pendingQuestId && progress.status === "active") ? game.pendingQuestId : undefined;
-  const normalized = { ...game, generatedQuests, questOffers: offers, quests, pendingQuestId };
+  const normalized = { ...game, generatedQuests, questOffers: offers, quests, pendingQuestId, pendingQuestDraft: pendingQuestId ? game.pendingQuestDraft : undefined };
   return refreshQuestOffers(normalized, 1, offers.length === 0 && quests.length === 0);
 }
 
@@ -1307,7 +1402,7 @@ function expireActiveQuests(game: GameState): GameState {
     const before = next;
     next = applyEffects(next, definition.failureEffects ?? []);
     const failed: QuestProgress = { ...progress, status: "failed", updatedTurn: next.turn, finishedTurn: next.turn, failureReason: "未能在期限内完成" };
-    next = { ...next, pendingQuestId: next.pendingQuestId === progress.questId ? undefined : next.pendingQuestId, quests: next.quests.map((quest) => quest === progress ? failed : quest) };
+    next = { ...next, pendingQuestId: next.pendingQuestId === progress.questId ? undefined : next.pendingQuestId, pendingQuestDraft: next.pendingQuestId === progress.questId ? undefined : next.pendingQuestDraft, quests: next.quests.map((quest) => quest === progress ? failed : quest) };
     next = addLog(next, `${definition.title} · 已逾期`, `任务期限已过，这条线索在时间中失去了回应。`, "danger", { kind: "quest", locationName: getCurrentLocation(next).name, changes: eventChanges(before, next), detail: "任务失败：超过期限", durationDays: 0 });
   }
   return next;
@@ -1334,7 +1429,9 @@ export function getQuestStage(game: GameState, questId: string): { quest: QuestD
 }
 
 export function getCurrentQuestStage(game: GameState): { quest: QuestDefinition; progress: QuestProgress; stage: QuestStageDefinition } | undefined {
-  return game.pendingQuestId ? getQuestStage(game, game.pendingQuestId) : undefined;
+  if (!game.pendingQuestId) return undefined;
+  const current = getQuestStage(game, game.pendingQuestId);
+  return current && game.pendingQuestDraft ? { ...current, stage: game.pendingQuestDraft } : current;
 }
 
 export function canAcceptQuest(game: GameState, questId: string): { allowed: boolean; reason?: string } {
@@ -1360,7 +1457,7 @@ export function acceptQuest(game: GameState, questId: string): GameState {
   let next: GameState = { ...game, questOffers: game.questOffers.filter((offer) => offer.questId !== questId), quests: [...game.quests, progress] };
   const text = `你接下了“${quest.title}”。${quest.summary}${progress.deadlineTurn !== undefined ? ` 此事需在第 ${progress.deadlineTurn} 天前完成。` : ""}`;
   next = addLog(next, `接取任务 · ${quest.title}`, text, "mystic", { kind: "quest", locationName: getCurrentLocation(game).name, detail: `阶段 1 / ${quest.stages.length}`, durationDays: 0 });
-  return { ...next, eventResult: { kind: "quest", title: `已接取 · ${quest.title}`, text, tone: "mystic", changes: [], durationDays: 0 } };
+  return resultWithPendingGeneratedContent(next, { kind: "quest", title: `已接取 · ${quest.title}`, text, tone: "mystic", changes: [], durationDays: 0 });
 }
 
 function objectiveReady(game: GameState, objective: QuestStageDefinition["objective"]): { allowed: boolean; reason?: string } {
@@ -1388,10 +1485,10 @@ export function canAdvanceQuest(game: GameState, questId: string): { allowed: bo
 function finalizeQuestFailure(before: GameState, after: GameState, quest: QuestDefinition, progress: QuestProgress, text: string, title: string, durationDays: number): GameState {
   let next = applyEffects(after, quest.failureEffects ?? []);
   const failed: QuestProgress = { ...progress, status: "failed", updatedTurn: next.turn, finishedTurn: next.turn, failureReason: text };
-  next = { ...next, pendingQuestId: undefined, quests: next.quests.map((candidate) => candidate.questId === progress.questId && candidate.status === "active" ? failed : candidate) };
+  next = { ...next, pendingQuestId: undefined, pendingQuestDraft: undefined, quests: next.quests.map((candidate) => candidate.questId === progress.questId && candidate.status === "active" ? failed : candidate) };
   const changes = eventChanges(before, next);
   next = addLog(next, `${quest.title} · 失败`, text, "danger", { kind: "quest", locationName: getCurrentLocation(next).name, changes, detail: title, durationDays });
-  return { ...next, eventResult: { kind: "quest", title: `${quest.title} · 失败`, text, tone: "danger", changes, durationDays } };
+  return resultWithPendingGeneratedContent(next, { kind: "quest", title: `${quest.title} · 失败`, text, tone: "danger", changes, durationDays });
 }
 
 function finalizeQuestAdvance(before: GameState, after: GameState, quest: QuestDefinition, progress: QuestProgress, text: string, tone: Tone, durationDays: number): GameState {
@@ -1401,24 +1498,24 @@ function finalizeQuestAdvance(before: GameState, after: GameState, quest: QuestD
     next = applyEffects(next, quest.completionEffects ?? []);
     if (quest.completionFlag) next = applyEffects(next, [{ type: "flag", key: quest.completionFlag }]);
     const completed: QuestProgress = { ...progress, status: "completed", stageIndex: nextStageIndex, updatedTurn: next.turn, finishedTurn: next.turn };
-    next = { ...next, pendingQuestId: undefined, quests: next.quests.map((candidate) => candidate.questId === progress.questId && candidate.status === "active" ? completed : candidate) };
+    next = { ...next, pendingQuestId: undefined, pendingQuestDraft: undefined, quests: next.quests.map((candidate) => candidate.questId === progress.questId && candidate.status === "active" ? completed : candidate) };
     const changes = eventChanges(before, next);
     const completionText = `${text}\n\n“${quest.title}”已经完成，新的因果也由此展开。`;
     next = addLog(next, `${quest.title} · 完成`, completionText, "good", { kind: "quest", locationName: getCurrentLocation(next).name, changes, detail: "任务完成", durationDays });
-    next = { ...next, eventResult: { kind: "quest", title: `${quest.title} · 完成`, text: completionText, tone: "good", changes, durationDays } };
+    next = resultWithPendingGeneratedContent(next, { kind: "quest", title: `${quest.title} · 完成`, text: completionText, tone: "good", changes, durationDays });
     return refreshQuestOffers(next, 1, false);
   }
   const updated: QuestProgress = { ...progress, stageIndex: nextStageIndex, updatedTurn: next.turn };
-  next = { ...next, pendingQuestId: undefined, quests: next.quests.map((candidate) => candidate.questId === progress.questId && candidate.status === "active" ? updated : candidate) };
+  next = { ...next, pendingQuestId: undefined, pendingQuestDraft: undefined, quests: next.quests.map((candidate) => candidate.questId === progress.questId && candidate.status === "active" ? updated : candidate) };
   const changes = eventChanges(before, next);
   next = addLog(next, `${quest.title} · ${quest.stages[nextStageIndex].title}`, text, tone, { kind: "quest", locationName: getCurrentLocation(next).name, changes, detail: `阶段 ${nextStageIndex + 1} / ${quest.stages.length}`, durationDays });
-  return { ...next, eventResult: { kind: "quest", title: quest.stages[nextStageIndex].title, text, tone, changes, durationDays } };
+  return resultWithPendingGeneratedContent(next, { kind: "quest", title: quest.stages[nextStageIndex].title, text, tone, changes, durationDays });
 }
 
 export function advanceQuest(game: GameState, questId: string): GameState {
   if (!canAdvanceQuest(game, questId).allowed) return game;
   const current = getQuestStage(game, questId)!;
-  if (current.stage.kind === "encounter") return { ...game, pendingQuestId: questId };
+  if (current.stage.kind === "encounter") return { ...game, pendingQuestId: questId, pendingQuestDraft: undefined };
   let next = game;
   const objective = current.stage.objective;
   if (objective?.type === "resource" && objective.consume) next = applyEffects(next, [{ type: "resource", key: objective.key, amount: -objective.amount }]);
@@ -1433,7 +1530,7 @@ export function abandonQuest(game: GameState, questId: string): GameState {
   let next: GameState = { ...game, quests: game.quests.map((candidate) => candidate === current.progress ? abandoned : candidate) };
   const text = `你放弃了“${current.quest.title}”。线索仍留在世间，但这一次不会再等你。`;
   next = addLog(next, `${current.quest.title} · 放弃`, text, "neutral", { kind: "quest", locationName: getCurrentLocation(game).name, detail: "主动放弃", durationDays: 0 });
-  return { ...next, eventResult: { kind: "quest", title: `已放弃 · ${current.quest.title}`, text, tone: "neutral", changes: [], durationDays: 0 } };
+  return resultWithPendingGeneratedContent(next, { kind: "quest", title: `已放弃 · ${current.quest.title}`, text, tone: "neutral", changes: [], durationDays: 0 });
 }
 
 function summary(reason: RunSummary["reason"], game: GameState): RunSummary {
@@ -1447,7 +1544,7 @@ function summary(reason: RunSummary["reason"], game: GameState): RunSummary {
 }
 
 function checkEnding(game: GameState): GameState {
-  if (game.resources.stamina <= 0 || game.resources.age >= game.resources.lifespan) return { ...game, status: "ended", pendingEventId: undefined, pendingEventQueue: undefined, pendingQuestId: undefined, summary: summary("fallen", game) };
+  if (game.resources.stamina <= 0 || game.resources.age >= game.resources.lifespan) return { ...game, status: "ended", pendingEventId: undefined, pendingEventQueue: undefined, pendingEventDraft: undefined, pendingEventDraftQueue: undefined, pendingQuestId: undefined, pendingQuestDraft: undefined, summary: summary("fallen", game) };
   return game;
 }
 
@@ -1625,7 +1722,7 @@ function finishNpcInteraction(game: GameState, npcId: string, interactionId: Npc
   if (interaction.setsRelationship) changes.push({ label: "特殊关系", amount: 1 });
   if (interaction.clearsRelationship) changes.push({ label: "特殊关系", amount: -1 });
   next = addLog(next, title, message, tone, { kind: "action", locationName: getCurrentLocation(game).name, changes, detail: interaction.setsRelationship ? `与${npc.name}结为${getNpcSpecialRelationshipLabel(interaction.setsRelationship)}` : `与${npc.name}建立关系`, durationDays });
-  next = { ...next, eventResult: { kind: "action", title, text: message, tone, changes, durationDays } };
+  next = resultWithPendingGeneratedContent(next, { kind: "action", title, text: message, tone, changes, durationDays, ...(generated?.conversation?.length ? { conversation: generated.conversation } : {}) });
   return checkEnding(next);
 }
 
@@ -1693,8 +1790,79 @@ export function canTravel(game: GameState, targetId: string): { allowed: boolean
   return { allowed: true };
 }
 
-function finishTravelLeg(game: GameState, targetId: string, generated?: AiGeneratedOutcome): GameState {
-  if (!canTravelLeg(game, targetId).allowed) return game;
+interface TravelEventSummary {
+  title: string;
+  body: string;
+  choiceLabel?: string;
+  outcomeText: string;
+  tone: Tone;
+  durationDays: number;
+}
+
+interface TravelLegResult {
+  game: GameState;
+  routeText: string;
+  tone: Tone;
+  durationDays: number;
+  event?: TravelEventSummary;
+}
+
+function chooseWeightedIndex(weights: number[], rngState: number): [number, number] {
+  const total = weights.reduce((sum, weight) => sum + Math.max(0, weight), 0);
+  let roll; let rng; [roll, rng] = nextRandom(rngState);
+  if (total <= 0) return [0, rng];
+  let cursor = roll * total;
+  for (let index = 0; index < weights.length; index += 1) {
+    cursor -= Math.max(0, weights[index]);
+    if (cursor <= 0) return [index, rng];
+  }
+  return [Math.max(0, weights.length - 1), rng];
+}
+
+function resolveTravelEventAutomatically(game: GameState, event: EventDefinition): { game: GameState; summary: TravelEventSummary } {
+  let rng = game.rngState;
+  const availableChoices = event.choices.filter((choice) => canChoose(game, choice));
+  let choice: EventChoice | undefined;
+  if (availableChoices.length) {
+    let choiceIndex; [choiceIndex, rng] = chooseWeightedIndex(availableChoices.map(() => 1), rng);
+    choice = availableChoices[choiceIndex];
+  }
+  const outcomes = choice?.outcomes.length
+    ? choice.outcomes
+    : event.outcomes?.length
+      ? event.outcomes
+      : [{ weight: 1, text: "这桩插曲没有掀起更多波澜，你继续赶路。", tone: "neutral" as Tone, effects: [] }];
+  const weights = choice ? adjustedOutcomeWeights({ ...game, rngState: rng }, choice) : outcomes.map((outcome) => outcome.weight);
+  let outcomeIndex; [outcomeIndex, rng] = chooseWeightedIndex(weights, rng);
+  const outcome = outcomes[outcomeIndex];
+  const durationDays = Math.max(1, Math.round(event.durationDays ?? 1));
+  let next = tick({
+    ...game,
+    rngState: rng,
+    seenEvents: { ...game.seenEvents, [event.id]: (game.seenEvents[event.id] ?? 0) + 1 },
+  }, durationDays);
+  next = applyEffects(next, outcome.effects);
+  if (choice && isCombatChoice(choice) && outcome.tone === "danger") {
+    const mitigation = Math.min(0.55, Math.max(0, (game.resources.battlePower - 30) * 0.01));
+    if (mitigation > 0) next = applyEffects(next, [{ type: "resource", key: "stamina", amount: Math.round(Math.abs(game.resources.battlePower - 30) * 0.2 * mitigation) }]);
+  }
+  const tone = outcome.tone ?? "neutral";
+  const changes = eventChanges(game, next);
+  next = addLog(next, event.title, outcome.text, tone, {
+    kind: "event",
+    locationName: getCurrentLocation(next).name,
+    changes,
+    detail: choice ? `行途自动裁定：${choice.label}` : "行途自动发生",
+    durationDays,
+  });
+  return {
+    game: checkEnding(next),
+    summary: { title: event.title, body: event.body, choiceLabel: choice?.label, outcomeText: outcome.text, tone, durationDays },
+  };
+}
+
+function finishTravelLeg(game: GameState, targetId: string, generated?: AiGeneratedOutcome): TravelLegResult {
+  if (!canTravelLeg(game, targetId).allowed) return { game, routeText: "", tone: "neutral", durationDays: 0 };
   const origin = getCurrentLocation(game);
   const target = game.world.locations.find((location) => location.id === targetId)!;
   const durationDays = 1;
@@ -1707,29 +1875,64 @@ function finishTravelLeg(game: GameState, targetId: string, generated?: AiGenera
   const travelText = generated?.text ?? localText;
   const title = generated?.title ?? "踏上行途";
   next = addLog(next, title, travelText, travelTone, { kind: "action", locationName: target.name, changes: eventChanges(game, next), detail: `从${origin.name}前往${target.name}`, durationDays });
+  let travelEvent: TravelEventSummary | undefined;
   let eventRoll; [eventRoll, next.rngState] = nextRandom(next.rngState);
   const eventChance = Math.min(0.96, 0.48 + target.travelCost * 0.035 + (target.danger === "绝险" ? 0.1 : 0) + worldDangerModifier(next));
   if (eventRoll < eventChance) {
     let eventId; [eventId, next.rngState] = selectEvent(next, "travel");
     if (eventId) {
-      next = queuePendingEvent(next, eventId);
-      next.seenEvents = { ...next.seenEvents, [eventId]: (next.seenEvents[eventId] ?? 0) + 1 };
+      const event = eventDefinitionFor(next, eventId);
+      if (event) {
+        const resolved = resolveTravelEventAutomatically(next, event);
+        next = resolved.game;
+        travelEvent = resolved.summary;
+      }
     }
   }
-  next = withResult(game, next, title, travelText, travelTone, "action", durationDays);
-  return checkEnding(next);
+  return {
+    game: checkEnding(next),
+    routeText: `${origin.name} → ${target.name}（消耗 ${target.travelCost} 点灵力）`,
+    tone: travelTone,
+    durationDays: durationDays + (travelEvent?.durationDays ?? 0),
+    event: travelEvent,
+  };
 }
 
 function travelSteps(game: GameState, steps: string[], generated?: AiGeneratedOutcome): GameState {
-  let next: GameState = { ...game, travelPlan: undefined };
+  const before = game;
+  let next: GameState = { ...game, travelPlan: undefined, eventResult: undefined };
+  const routeLines: string[] = [];
+  const travelEvents: TravelEventSummary[] = [];
+  let totalDurationDays = 0;
+  let resultTone: Tone = "neutral";
   for (let index = 0; index < steps.length; index += 1) {
-    next = finishTravelLeg(next, steps[index], index === 0 ? generated : undefined);
-    const remaining = steps.slice(index + 1);
-    if (next.status !== "playing" || hasPendingNarrative(next)) {
-      return remaining.length && next.status === "playing" ? { ...next, travelPlan: remaining } : { ...next, travelPlan: undefined };
-    }
+    const leg = finishTravelLeg(next, steps[index], index === 0 ? generated : undefined);
+    if (!leg.routeText) break;
+    next = leg.game;
+    routeLines.push(leg.routeText);
+    totalDurationDays += leg.durationDays;
+    if (leg.event) travelEvents.push(leg.event);
+    if (leg.tone === "danger" || leg.event?.tone === "danger") resultTone = "danger";
+    else if (resultTone !== "danger" && (leg.tone === "mystic" || leg.event?.tone === "mystic")) resultTone = "mystic";
+    else if (resultTone === "neutral" && (leg.tone === "good" || leg.event?.tone === "good")) resultTone = "good";
+    if (next.status !== "playing") break;
   }
-  return { ...next, travelPlan: undefined };
+  if (!routeLines.length) return game;
+  const routeText = `行程路线\n${routeLines.map((line, index) => `${index + 1}. ${line}`).join("\n")}`;
+  const eventText = travelEvents.length
+    ? `\n\n途中事件（${travelEvents.length}）\n${travelEvents.map((event, index) => `${index + 1}. 【${event.title}】${event.body}\n${event.choiceLabel ? `自动应对：${event.choiceLabel}。` : ""}${event.outcomeText}`).join("\n\n")}`
+    : "\n\n一路无事，沿途只有风声与脚步声。";
+  const title = travelEvents.length ? `行途见闻 · ${travelEvents.length} 桩` : "顺利抵达";
+  const result = resultWithPendingGeneratedContent(next, {
+    kind: "action",
+    title,
+    text: `${routeText}${eventText}`,
+    tone: resultTone,
+    changes: eventChanges(before, next),
+    durationDays: totalDurationDays,
+    ...(generated?.conversation?.length ? { conversation: generated.conversation } : {}),
+  });
+  return { ...result, travelPlan: undefined };
 }
 
 function finishTravel(game: GameState, targetId: string, generated?: AiGeneratedOutcome): GameState {
@@ -1755,7 +1958,8 @@ function adjustedOutcomeWeights(game: GameState, choice: EventChoice): number[] 
   const stats = effectiveStats(game);
   const isCombat = isCombatChoice(choice);
   const combatBias = isCombat ? (game.resources.battlePower - 40) * 0.012 : 0;
-  const positiveBias = (stats.fortune - 4) * 0.035 + (stats.spirit - 4) * 0.018 + combatBias - (game.character.talent.dangerModifier ?? 0);
+  const statusDangerModifier = game.statuses.reduce((sum, status) => sum + (status.dangerModifier ?? 0), 0);
+  const positiveBias = (stats.fortune - 4) * 0.035 + (stats.spirit - 4) * 0.018 + combatBias - (game.character.talent.dangerModifier ?? 0) - statusDangerModifier;
   return choice.outcomes.map((outcome, index) => {
     if (choice.outcomes.length === 1) return outcome.weight;
     const isGood = (outcome.tone ?? "neutral") !== "danger";
@@ -1789,12 +1993,12 @@ function resolveQuestStageInternal(game: GameState, choiceId: string, generated?
     localOutcome = { weight: 1, text: current.stage.body, tone: "mystic", result: "advance", effects: [] };
   }
   const durationDays = Math.max(1, Math.round(current.stage.durationDays ?? 1));
-  let next = tick({ ...game, rngState, pendingQuestId: undefined }, durationDays);
+  let next = tick({ ...game, rngState, pendingQuestId: undefined, pendingQuestDraft: undefined }, durationDays);
   const afterClock = next.quests.find((progress) => progress.questId === current.quest.id && progress.status === "active");
   if (!afterClock) {
     const text = `你赶到关键处时，任务期限已经过去。“${current.quest.title}”没能继续。`;
     const changes = eventChanges(game, next);
-    return { ...next, eventResult: { kind: "quest", title: `${current.quest.title} · 已逾期`, text, tone: "danger", changes, durationDays } };
+    return resultWithPendingGeneratedContent(next, { kind: "quest", title: `${current.quest.title} · 已逾期`, text, tone: "danger", changes, durationDays });
   }
   const outcome = generated
     ? { ...localOutcome, text: generated.text, tone: generated.tone, effects: generated.effects }
@@ -1807,7 +2011,7 @@ function resolveQuestStageInternal(game: GameState, choiceId: string, generated?
     next = { ...next, quests: next.quests.map((progress) => progress.questId === stayed.questId && progress.status === "active" ? stayed : progress) };
     const changes = eventChanges(game, next);
     next = addLog(next, `${current.quest.title} · 受阻`, outcome.text, outcome.tone ?? "neutral", { kind: "quest", locationName: getCurrentLocation(next).name, changes, detail: `仍处于阶段 ${afterClock.stageIndex + 1}`, durationDays });
-    return checkEnding({ ...next, eventResult: { kind: "quest", title: current.stage.title, text: outcome.text, tone: outcome.tone ?? "neutral", changes, durationDays } });
+    return checkEnding(resultWithPendingGeneratedContent(next, { kind: "quest", title: current.stage.title, text: outcome.text, tone: outcome.tone ?? "neutral", changes, durationDays }));
   }
   return checkEnding(finalizeQuestAdvance(game, next, current.quest, afterClock, outcome.text, outcome.tone ?? "neutral", durationDays));
 }
@@ -1821,7 +2025,7 @@ export function resolveQuestStageWithAi(game: GameState, choiceId: string, gener
 }
 
 function resolveEventInternal(game: GameState, choiceId: string, generated?: AiGeneratedOutcome): GameState {
-  const event = game.pendingEventId ? eventDefinitionFor(game, game.pendingEventId) : undefined;
+  const event = game.pendingEventId ? game.pendingEventDraft ?? eventDefinitionFor(game, game.pendingEventId) : undefined;
   const choice = event?.choices.find((item) => item.id === choiceId);
   if (!event || (event.choices.length > 0 && (!choice || !canChoose(game, choice)))) return game;
 
@@ -1845,7 +2049,7 @@ function resolveEventInternal(game: GameState, choiceId: string, generated?: AiG
   }
 
   const durationDays = Math.max(1, Math.round(event.durationDays ?? 1));
-  let next = tick({ ...game, rngState: rng, pendingEventId: undefined }, durationDays);
+  let next = tick({ ...game, rngState: rng, pendingEventId: undefined, pendingEventDraft: undefined }, durationDays);
   next = promotePendingEvent(next);
   next = applyEffects(next, outcome.effects);
   if (choice && isCombatChoice(choice) && outcome.tone === "danger") {
@@ -1854,17 +2058,15 @@ function resolveEventInternal(game: GameState, choiceId: string, generated?: AiG
   }
   const resultTitle = generated?.title ?? event.title;
   next = addLog(next, resultTitle, outcome.text, outcome.tone ?? "neutral", { kind: "event", locationName: getCurrentLocation(game).name, changes: eventChanges(game, next), detail: choice ? `选择：${choice.label}` : "自动发生的异闻", durationDays });
-  next = {
-    ...next,
-    eventResult: {
+  next = resultWithPendingGeneratedContent(next, {
       kind: "event",
       title: resultTitle,
       text: outcome.text,
       tone: outcome.tone ?? "neutral",
       changes: eventChanges(game, next),
       durationDays,
-    },
-  };
+      ...(generated?.conversation?.length ? { conversation: generated.conversation } : {}),
+  });
   return checkEnding(next);
 }
 
@@ -1874,6 +2076,95 @@ export function resolveEvent(game: GameState, choiceId: string): GameState {
 
 export function resolveEventWithAi(game: GameState, choiceId: string, generated: AiGeneratedOutcome): GameState {
   return resolveEventInternal(game, choiceId, generated);
+}
+
+export function rewritePendingEvent(game: GameState, rewrite: AiEventRewrite): GameState {
+  if (!game.pendingEventId) return game;
+  const current = getCurrentEvent(game);
+  if (!current) return game;
+  const draft = { ...current, ...rewrite.event, id: current.id, once: current.once };
+  const followUps = (rewrite.followUpEvents ?? []).filter((event) => event.id && event.id !== current.id);
+  return {
+    ...game,
+    pendingEventDraft: draft,
+    pendingEventDraftQueue: followUps.length
+      ? [...(game.pendingEventDraftQueue ?? []), ...followUps]
+      : game.pendingEventDraftQueue,
+  };
+}
+
+export function rewritePendingQuestStage(game: GameState, rewrite: AiQuestStageRewrite): GameState {
+  const current = getCurrentQuestStage(game);
+  if (!current) return game;
+  const draft: QuestStageDefinition = {
+    ...current.stage,
+    ...rewrite.stage,
+    id: current.stage.id,
+    kind: "encounter",
+  };
+  const followUps = (rewrite.followUpEvents ?? []).filter((event) => event.id);
+  return {
+    ...game,
+    pendingQuestDraft: draft,
+    pendingEventDraftQueue: followUps.length
+      ? [...(game.pendingEventDraftQueue ?? []), ...followUps]
+      : game.pendingEventDraftQueue,
+  };
+}
+
+export function rewriteEventResult(game: GameState, rewrite: AiResultRewrite): GameState {
+  if (!game.eventResult) return game;
+  const followUps = (rewrite.followUpEvents ?? []).filter((event) => event.id);
+  return {
+    ...game,
+    eventResult: {
+      ...game.eventResult,
+      title: rewrite.title,
+      text: rewrite.text,
+      tone: rewrite.tone,
+      choices: rewrite.choices,
+      ...(rewrite.conversation?.length ? { conversation: rewrite.conversation } : { conversation: undefined }),
+    },
+    pendingEventDraftQueue: followUps.length
+      ? [...(game.pendingEventDraftQueue ?? []), ...followUps]
+      : game.pendingEventDraftQueue,
+  };
+}
+
+export function resolveEventResultChoice(game: GameState, choiceId: string): GameState {
+  const result = game.eventResult;
+  const choice = result?.choices?.find((candidate) => candidate.id === choiceId);
+  if (!result || !choice || !canChoose(game, choice)) return game;
+  const weights = adjustedOutcomeWeights(game, choice);
+  const total = weights.reduce((sum, weight) => sum + weight, 0);
+  let roll; let rng; [roll, rng] = nextRandom(game.rngState);
+  let cursor = roll * total;
+  let index = 0;
+  for (let i = 0; i < weights.length; i += 1) {
+    cursor -= weights[i];
+    if (cursor <= 0) { index = i; break; }
+  }
+  const outcome = choice.outcomes[index];
+  const durationDays = 1;
+  let next = tick({ ...game, rngState: rng, eventResult: undefined }, durationDays);
+  next = applyEffects(next, outcome.effects);
+  const tone = outcome.tone ?? "neutral";
+  const changes = eventChanges(game, next);
+  next = addLog(next, result.title, outcome.text, tone, {
+    kind: result.kind ?? "event",
+    locationName: getCurrentLocation(next).name,
+    changes,
+    detail: `选择：${choice.label}`,
+    durationDays,
+  });
+  return checkEnding(resultWithPendingGeneratedContent(next, {
+      kind: result.kind,
+      title: result.title,
+      text: outcome.text,
+      tone,
+      changes,
+      durationDays,
+  }));
 }
 
 export function getBreakthroughInfo(game: GameState, usePill: boolean) {
@@ -1933,7 +2224,7 @@ export function breakthrough(game: GameState, usePill: boolean): GameState {
     next = addLog(next, "破境成功", breakthroughText, "mystic", { kind: "action", locationName: getCurrentLocation(game).name, changes: eventChanges(game, next), detail: `从${oldRealm}突破至${REALMS[next.realmStage - 1]}`, durationDays: 1 });
     next = withResult(game, next, "破境成功", breakthroughText, "mystic", "action", 1);
     if (next.realmStage >= REALMS.length) {
-      next = { ...next, status: "ended", pendingEventId: undefined, pendingEventQueue: undefined, pendingQuestId: undefined };
+      next = { ...next, status: "ended", pendingEventId: undefined, pendingEventQueue: undefined, pendingEventDraft: undefined, pendingEventDraftQueue: undefined, pendingQuestId: undefined, pendingQuestDraft: undefined };
       return { ...next, summary: summary("ascension", next) };
     }
   } else {
@@ -1995,7 +2286,7 @@ export function claimLegacy(game: GameState, meta: MetaProgress): { game: GameSt
 }
 
 export function getCurrentEvent(game: GameState): EventDefinition | undefined {
-  return game.pendingEventId ? eventDefinitionFor(game, game.pendingEventId) : undefined;
+  return game.pendingEventId ? game.pendingEventDraft ?? eventDefinitionFor(game, game.pendingEventId) : undefined;
 }
 
 export function dismissEventResult(game: GameState): GameState {
